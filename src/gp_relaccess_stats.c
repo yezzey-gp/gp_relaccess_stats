@@ -15,6 +15,7 @@
 #include "utils/datetime.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "tcop/utility.h"
 
 #include <stdlib.h>
 
@@ -34,9 +35,14 @@ static uint32 relaccess_hash_fn(const void *key, Size keysize);
 static int relaccess_match_fn(const void *key1, const void *key2, Size keysize);
 static bool collect_relaccess_hook(List *rangeTable, bool ereport_on_violation);
 static void relaccess_xact_callback(XactEvent event, void *arg);
+static void collect_truncate_hook(Node *parsetree, const char *queryString,
+                                  ProcessUtilityContext context,
+                                  ParamListInfo params, DestReceiver *dest,
+                                  char *completionTag);
 
-shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-ExecutorCheckPerms_hook_type prev_check_perms_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static ExecutorCheckPerms_hook_type prev_check_perms_hook = NULL;
+static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 
 typedef struct relaccessHashKey {
   Oid dbid;
@@ -141,6 +147,8 @@ void _PG_init(void) {
   shmem_startup_hook = relaccess_shmem_startup;
   prev_check_perms_hook = ExecutorCheckPerms_hook;
   ExecutorCheckPerms_hook = collect_relaccess_hook;
+  next_ProcessUtility_hook = ProcessUtility_hook;
+  ProcessUtility_hook = collect_truncate_hook;
   RequestAddinLWLocks(2);
   size = MAXALIGN(sizeof(relaccessGlobalData));
   size =
@@ -155,6 +163,7 @@ void _PG_fini(void) {
   }
   shmem_startup_hook = prev_shmem_startup_hook;
   ExecutorCheckPerms_hook = prev_check_perms_hook;
+  ProcessUtility_hook = next_ProcessUtility_hook;
 }
 
 static bool collect_relaccess_hook(List *rangeTable,
@@ -186,6 +195,43 @@ static bool collect_relaccess_hook(List *rangeTable,
   }
   MemoryContextSwitchTo(oldcontext);
   return true;
+}
+
+static void collect_truncate_hook(Node *parsetree, const char *queryString,
+                                  ProcessUtilityContext context,
+                                  ParamListInfo params, DestReceiver *dest,
+                                  char *completionTag) {
+  if (nodeTag(parsetree) == T_TruncateStmt) {
+    MemoryContext oldcontext;
+    oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+    TruncateStmt *stmt = (TruncateStmt *)parsetree;
+    ListCell *cell;
+    /**
+     *  TODO: TRUNCATE may be called with ONLY option which limits it only to
+     *the root partition. Otherwise it will truncate all child partitions. We
+     *might wish to track the difference by explicitly adding records for each
+     *truncated partition in the future
+     **/
+    foreach (cell, stmt->relations) {
+      RangeVar *rv = lfirst(cell);
+      Relation rel;
+      rel = heap_openrv(rv, AccessExclusiveLock);
+      accessRecord *record = palloc(sizeof(accessRecord));
+      record->when = GetCurrentTimestamp();
+      record->relid = rel->rd_id;
+      record->privs = ACL_TRUNCATE;
+      cached_entries = lappend(cached_entries, record);
+      heap_close(rel, NoLock);
+    }
+    MemoryContextSwitchTo(oldcontext);
+  }
+  if (next_ProcessUtility_hook) {
+    next_ProcessUtility_hook(parsetree, queryString, context, params, dest,
+                             completionTag);
+  } else {
+    standard_ProcessUtility(parsetree, queryString, context, params, dest,
+                            completionTag);
+  }
 }
 
 #define UPDATE_STAT(lowercase, uppercase)                                      \
@@ -313,10 +359,9 @@ static void relaccess_upsert_from_file() {
       "CREATE TEMP TABLE relaccess_stats_update_tmp (LIKE relaccess_stats) "
       "distributed by (dbid, relid)",
       false, 0);
-  SPI_execute(
-      "COPY relaccess_stats_update_tmp FROM 'relaccess_stats_dump.csv' "
-      "WITH (FORMAT 'csv', DELIMITER ',');",
-      false, 0);
+  SPI_execute("COPY relaccess_stats_update_tmp FROM 'relaccess_stats_dump.csv' "
+              "WITH (FORMAT 'csv', DELIMITER ',');",
+              false, 0);
   // two queries below together simulate upsert
   SPI_execute("INSERT INTO relaccess_stats "
               "SELECT * FROM relaccess_stats_update_tmp stage "
