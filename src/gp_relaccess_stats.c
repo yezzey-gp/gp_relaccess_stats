@@ -1,0 +1,351 @@
+#include "postgres.h"
+#include "access/xact.h"
+#include "access/hash.h"
+#include "cdb/cdbvars.h"
+#include "commands/dbcommands.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
+#include "miscadmin.h"
+#include "pg_config_ext.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
+#include "utils/builtins.h"
+#include "utils/datetime.h"
+#include "utils/memutils.h"
+#include "utils/timestamp.h"
+
+#include <stdlib.h>
+
+PG_MODULE_MAGIC;
+
+void _PG_init(void);
+void _PG_fini(void);
+PG_FUNCTION_INFO_V1(relaccess_stats_update);
+
+static void relaccess_stats_update_internal(void);
+static void relaccess_dump_to_file(void);
+static void relaccess_upsert_from_file(void);
+static void recover_leftover_dump(void);
+static void relaccess_shmem_startup(void);
+static void relaccess_shmem_shutdown(int code, Datum arg);
+static uint32 relaccess_hash_fn(const void *key, Size keysize);
+static int relaccess_match_fn(const void *key1, const void *key2, Size keysize);
+static bool collect_relaccess_hook(List *rangeTable, bool ereport_on_violation);
+static void relaccess_xact_callback(XactEvent event, void *arg);
+
+shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+ExecutorCheckPerms_hook_type prev_check_perms_hook = NULL;
+
+typedef struct relaccessHashKey {
+  Oid dbid;
+  Oid relid;
+} relaccessHashKey;
+
+typedef struct relaccessEntry {
+  relaccessHashKey key;
+  Oid userid;
+  TimestampTz last_read;
+  TimestampTz last_write;
+  int64 n_select;
+  int64 n_insert;
+  int64 n_update;
+  int64 n_delete;
+  int64 n_truncate;
+} relaccessEntry;
+
+typedef struct relaccessGlobalData {
+  LWLock *relaccess_ht_lock;
+  LWLock *relaccess_file_lock;
+} relaccessGlobalData;
+
+typedef struct accessRecord {
+  Timestamp when;
+  Oid relid;
+  AclMode privs;
+} accessRecord;
+
+static relaccessGlobalData *data;
+static HTAB *relaccesses;
+static int32 relaccess_max = 200000;
+static List *cached_entries = NIL;
+
+static const char *const DUMP_FILENAME = "relaccess_stats_dump.csv";
+
+#define IS_POSTGRES_DB                                                         \
+  (strcmp("postgres", get_database_name(MyDatabaseId)) == 0)
+
+static void relaccess_shmem_startup() {
+  bool found;
+  HASHCTL info;
+
+  if (prev_shmem_startup_hook)
+    prev_shmem_startup_hook();
+
+  LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+  data = (relaccessGlobalData *)(ShmemInitStruct(
+      "relaccess_stats", sizeof(relaccessGlobalData), &found));
+  if (!found) {
+    data->relaccess_ht_lock = LWLockAssign();
+    data->relaccess_file_lock = LWLockAssign();
+  }
+
+  memset(&info, 0, sizeof(info));
+  info.keysize = sizeof(relaccessHashKey);
+  info.entrysize = sizeof(relaccessEntry);
+  info.hash = relaccess_hash_fn;
+  info.match = relaccess_match_fn;
+  relaccesses =
+      ShmemInitHash("relaccess_stats hash", relaccess_max, relaccess_max, &info,
+                    HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+
+  LWLockRelease(AddinShmemInitLock);
+
+  if (!IsUnderPostmaster) {
+    on_shmem_exit(relaccess_shmem_shutdown, (Datum)0);
+  }
+}
+
+static void relaccess_shmem_shutdown(int code, Datum arg) {
+  if (code || !data || !relaccesses) {
+    return;
+  }
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
+  relaccess_dump_to_file();
+  LWLockRelease(data->relaccess_file_lock);
+}
+
+static uint32 relaccess_hash_fn(const void *key, Size keysize) {
+  const relaccessHashKey *k = (const relaccessHashKey *)key;
+  return hash_uint32((uint32)k->dbid) ^ hash_uint32((uint32)k->relid);
+}
+
+static int relaccess_match_fn(const void *key1, const void *key2,
+                              Size keysize) {
+  const relaccessHashKey *k1 = (const relaccessHashKey *)key1;
+  const relaccessHashKey *k2 = (const relaccessHashKey *)key2;
+  return (k1->dbid == k2->dbid && k1->relid == k2->relid ? 0 : 1);
+}
+
+void _PG_init(void) {
+  Size size;
+  if (Gp_role != GP_ROLE_DISPATCH) {
+    return;
+  }
+  if (!process_shared_preload_libraries_in_progress) {
+    return;
+  }
+  prev_shmem_startup_hook = shmem_startup_hook;
+  shmem_startup_hook = relaccess_shmem_startup;
+  prev_check_perms_hook = ExecutorCheckPerms_hook;
+  ExecutorCheckPerms_hook = collect_relaccess_hook;
+  RequestAddinLWLocks(2);
+  size = MAXALIGN(sizeof(relaccessGlobalData));
+  size =
+      add_size(size, hash_estimate_size(relaccess_max, sizeof(relaccessEntry)));
+  RequestAddinShmemSpace(size);
+  RegisterXactCallback(relaccess_xact_callback, NULL);
+}
+
+void _PG_fini(void) {
+  if (Gp_role != GP_ROLE_DISPATCH) {
+    return;
+  }
+  shmem_startup_hook = prev_shmem_startup_hook;
+  ExecutorCheckPerms_hook = prev_check_perms_hook;
+}
+
+static bool collect_relaccess_hook(List *rangeTable,
+                                   bool ereport_on_violation) {
+  if (!prev_check_perms_hook(rangeTable, ereport_on_violation)) {
+    return false;
+  }
+  if (Gp_role != GP_ROLE_DISPATCH) {
+    return true;
+  }
+  MemoryContext oldcontext;
+  oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+  ListCell *l;
+  foreach (l, rangeTable) {
+    RangeTblEntry *rte = (RangeTblEntry *)lfirst(l);
+    if (rte->rtekind != RTE_RELATION) {
+      continue;
+    }
+    Oid relOid = rte->relid;
+    AclMode requiredPerms = rte->requiredPerms;
+    if (requiredPerms &
+        (ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) {
+      accessRecord *record = palloc(sizeof(accessRecord));
+      record->when = GetCurrentTimestamp();
+      record->relid = relOid;
+      record->privs = requiredPerms;
+      cached_entries = lappend(cached_entries, record);
+    }
+  }
+  MemoryContextSwitchTo(oldcontext);
+  return true;
+}
+
+#define UPDATE_STAT(lowercase, uppercase)                                      \
+  entry->n_##lowercase += (record->privs & ACL_##uppercase ? 1 : 0)
+
+static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
+  if (Gp_role != GP_ROLE_DISPATCH) {
+    return;
+  }
+  if (cached_entries == NIL) {
+    return;
+  }
+  Assert(GetCurrentTransactionNestLevel == 1);
+  if (event == XACT_EVENT_COMMIT) {
+    ListCell *l;
+    foreach (l, cached_entries) {
+      accessRecord *record = (accessRecord *)lfirst(l);
+      LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+      bool found;
+      relaccessHashKey key;
+      key.dbid = MyDatabaseId;
+      key.relid = record->relid;
+      relaccessEntry *entry =
+          (relaccessEntry *)hash_search(relaccesses, &key, HASH_ENTER, &found);
+      if (!found) {
+        entry->key = key;
+        entry->userid = GetUserId();
+        entry->last_read = 0;
+        entry->last_write = 0;
+        entry->n_select = 0;
+        entry->n_insert = 0;
+        entry->n_update = 0;
+        entry->n_delete = 0;
+        entry->n_truncate = 0;
+      }
+      UPDATE_STAT(select, SELECT);
+      UPDATE_STAT(insert, INSERT);
+      UPDATE_STAT(update, UPDATE);
+      UPDATE_STAT(delete, DELETE);
+      UPDATE_STAT(truncate, TRUNCATE);
+      if (record->privs & (ACL_SELECT)) {
+        entry->last_read = Max(GetCurrentTimestamp(), entry->last_read);
+      }
+      if (record->privs &
+          (ACL_INSERT | ACL_DELETE | ACL_UPDATE | ACL_TRUNCATE)) {
+        entry->last_write = Max(GetCurrentTimestamp(), entry->last_write);
+      }
+      LWLockRelease(data->relaccess_ht_lock);
+    }
+    list_free_deep(cached_entries);
+    cached_entries = NIL;
+  } else if (event == XACT_EVENT_ABORT) {
+    list_free_deep(cached_entries);
+    cached_entries = NIL;
+  }
+}
+
+Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
+  relaccess_stats_update_internal();
+  PG_RETURN_VOID();
+}
+
+static void relaccess_stats_update_internal() {
+  if (!IS_POSTGRES_DB) {
+    elog(WARNING, "relaccess_stats_update should only ever be called from "
+                  "'postgres' database");
+    return;
+  }
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
+  recover_leftover_dump();
+  relaccess_dump_to_file();
+  relaccess_upsert_from_file();
+  unlink(DUMP_FILENAME);
+  LWLockRelease(data->relaccess_file_lock);
+}
+
+static void relaccess_dump_to_file() {
+  unlink(DUMP_FILENAME);
+  FILE *file = AllocateFile(DUMP_FILENAME, "wt");
+  if (file == NULL) {
+    // TODO: handle
+  }
+  LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+  // Dump to tmp .csv file and clear the HT
+  HASH_SEQ_STATUS hash_seq;
+  relaccessEntry *entry;
+  StringInfoData entry_csv_line;
+  initStringInfo(&entry_csv_line);
+  hash_seq_init(&hash_seq, relaccesses);
+  // alas, timestamptz_to_str isn't safe to be called twice in appendStringInfo
+  char read_time_buf[MAXDATELEN + 1];
+  char write_time_buf[MAXDATELEN + 1];
+  while ((entry = hash_seq_search(&hash_seq)) != NULL) {
+    strncpy(read_time_buf, timestamptz_to_str(entry->last_read), MAXDATELEN);
+    strncpy(write_time_buf, timestamptz_to_str(entry->last_write), MAXDATELEN);
+    read_time_buf[MAXDATELEN] = 0;
+    write_time_buf[MAXDATELEN] = 0;
+    appendStringInfo(
+        &entry_csv_line, "%d,%d,%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
+        entry->key.dbid, entry->key.relid, entry->userid, read_time_buf,
+        write_time_buf, entry->n_select, entry->n_insert, entry->n_update,
+        entry->n_delete, entry->n_truncate);
+    if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, file) !=
+        entry_csv_line.len) {
+      hash_seq_term(&hash_seq);
+      // TODO: handle
+      break;
+    }
+    resetStringInfo(&entry_csv_line);
+    // TODO: figure out a safer way to remove entries from HT.
+    // If for some reason we fail upserting dumped data somewhere later
+    // those stats are forever lost for us
+    bool found;
+    hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
+    Assert(found);
+  }
+  LWLockRelease(data->relaccess_ht_lock);
+  FreeFile(file);
+}
+
+static void relaccess_upsert_from_file() {
+  SPI_connect();
+  SPI_execute("DROP TABLE IF EXISTS relaccess_stats_update_tmp;", false, 0);
+  SPI_execute(
+      "CREATE TEMP TABLE relaccess_stats_update_tmp (LIKE relaccess_stats) "
+      "distributed by (dbid, relid)",
+      false, 0);
+  SPI_execute(
+      "COPY relaccess_stats_update_tmp FROM 'relaccess_stats_dump.csv' "
+      "WITH (FORMAT 'csv', DELIMITER ',');",
+      false, 0);
+  // two queries below together simulate upsert
+  SPI_execute("INSERT INTO relaccess_stats "
+              "SELECT * FROM relaccess_stats_update_tmp stage "
+              " WHERE NOT EXISTS ("
+              "SELECT 1 FROM relaccess_stats orig "
+              "WHERE orig.dbid = stage.dbid AND orig.relid = stage.relid);",
+              false, 0);
+  SPI_execute("UPDATE relaccess_stats orig SET "
+              "userid = stage.userid,"
+              "last_read = stage.last_read,"
+              "last_write = stage.last_write,"
+              "n_select_queries = stage.n_select_queries,"
+              "n_insert_queries = stage.n_insert_queries,"
+              "n_update_queries = stage.n_update_queries,"
+              "n_delete_queries = stage.n_delete_queries,"
+              "n_truncate_queries = stage.n_truncate_queries "
+              "FROM relaccess_stats_update_tmp stage "
+              "WHERE orig.dbid = stage.dbid AND orig.relid = stage.relid;",
+              false, 0);
+  SPI_execute("DROP TABLE IF EXISTS relaccess_stats_update_tmp;", false, 0);
+  SPI_finish();
+}
+
+static void recover_leftover_dump() {
+  FILE *f = AllocateFile(DUMP_FILENAME, "rt");
+  if (f == NULL) {
+    return;
+  }
+  relaccess_upsert_from_file();
+  FreeFile(f);
+  unlink(DUMP_FILENAME);
+}
