@@ -205,7 +205,8 @@ void _PG_fini(void) {
 
 static bool collect_relaccess_hook(List *rangeTable,
                                    bool ereport_on_violation) {
-  if (!prev_check_perms_hook(rangeTable, ereport_on_violation)) {
+  if (prev_check_perms_hook &&
+      !prev_check_perms_hook(rangeTable, ereport_on_violation)) {
     return false;
   }
   if (Gp_role != GP_ROLE_DISPATCH) {
