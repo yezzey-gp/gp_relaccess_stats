@@ -33,16 +33,22 @@ static void relaccess_shmem_startup(void);
 static void relaccess_shmem_shutdown(int code, Datum arg);
 static uint32 relaccess_hash_fn(const void *key, Size keysize);
 static int relaccess_match_fn(const void *key1, const void *key2, Size keysize);
+static uint32 local_relaccess_hash_fn(const void *key, Size keysize);
+static int local_relaccess_match_fn(const void *key1, const void *key2,
+                                    Size keysize);
 static bool collect_relaccess_hook(List *rangeTable, bool ereport_on_violation);
 static void relaccess_xact_callback(XactEvent event, void *arg);
 static void collect_truncate_hook(Node *parsetree, const char *queryString,
                                   ProcessUtilityContext context,
                                   ParamListInfo params, DestReceiver *dest,
                                   char *completionTag);
+static void relaccess_executor_end_hook(QueryDesc *query_desc);
+static void memorize_local_access_entry(Oid relid, AclMode perms);
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorCheckPerms_hook_type prev_check_perms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 
 typedef struct relaccessHashKey {
   Oid dbid;
@@ -66,16 +72,23 @@ typedef struct relaccessGlobalData {
   LWLock *relaccess_file_lock;
 } relaccessGlobalData;
 
-typedef struct accessRecord {
-  Timestamp when;
+typedef struct localAccessKey {
   Oid relid;
-  AclMode privs;
-} accessRecord;
+  int stmt_cnt;
+} localAccessKey;
+
+typedef struct localAccessEntry {
+  localAccessKey key;
+  Timestamp when;
+  AclMode perms;
+} localAccessEntry;
 
 static relaccessGlobalData *data;
 static HTAB *relaccesses;
-static int32 relaccess_max = 200000;
-static List *cached_entries = NIL;
+static const int32 RELACCESS_MAX = 200000;
+static HTAB *local_access_entries = NULL;
+static const int32 LOCAL_HTAB_SZ = 256;
+static int stmt_counter = 0;
 
 static const char *const DUMP_FILENAME = "relaccess_stats_dump.csv";
 
@@ -104,7 +117,7 @@ static void relaccess_shmem_startup() {
   info.hash = relaccess_hash_fn;
   info.match = relaccess_match_fn;
   relaccesses =
-      ShmemInitHash("relaccess_stats hash", relaccess_max, relaccess_max, &info,
+      ShmemInitHash("relaccess_stats hash", RELACCESS_MAX, RELACCESS_MAX, &info,
                     HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
   LWLockRelease(AddinShmemInitLock);
@@ -135,6 +148,18 @@ static int relaccess_match_fn(const void *key1, const void *key2,
   return (k1->dbid == k2->dbid && k1->relid == k2->relid ? 0 : 1);
 }
 
+static uint32 local_relaccess_hash_fn(const void *key, Size keysize) {
+  const localAccessKey *k = (const localAccessKey *)key;
+  return hash_uint32((uint32)k->stmt_cnt) ^ hash_uint32((uint32)k->relid);
+}
+
+static int local_relaccess_match_fn(const void *key1, const void *key2,
+                                    Size keysize) {
+  const localAccessKey *k1 = (const localAccessKey *)key1;
+  const localAccessKey *k2 = (const localAccessKey *)key2;
+  return (k1->stmt_cnt == k2->stmt_cnt && k1->relid == k2->relid ? 0 : 1);
+}
+
 void _PG_init(void) {
   Size size;
   if (Gp_role != GP_ROLE_DISPATCH) {
@@ -149,12 +174,23 @@ void _PG_init(void) {
   ExecutorCheckPerms_hook = collect_relaccess_hook;
   next_ProcessUtility_hook = ProcessUtility_hook;
   ProcessUtility_hook = collect_truncate_hook;
+  prev_ExecutorEnd_hook = ExecutorEnd_hook;
+  ExecutorEnd_hook = relaccess_executor_end_hook;
   RequestAddinLWLocks(2);
   size = MAXALIGN(sizeof(relaccessGlobalData));
   size =
-      add_size(size, hash_estimate_size(relaccess_max, sizeof(relaccessEntry)));
+      add_size(size, hash_estimate_size(RELACCESS_MAX, sizeof(relaccessEntry)));
   RequestAddinShmemSpace(size);
   RegisterXactCallback(relaccess_xact_callback, NULL);
+  HASHCTL ctl;
+  MemSet(&ctl, 0, sizeof(ctl));
+  ctl.keysize = sizeof(localAccessKey);
+  ctl.entrysize = sizeof(localAccessEntry);
+  ctl.hash = local_relaccess_hash_fn;
+  ctl.match = local_relaccess_match_fn;
+  local_access_entries =
+      hash_create("Transaction relaccess entries", LOCAL_HTAB_SZ, &ctl,
+                  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 }
 
 void _PG_fini(void) {
@@ -164,6 +200,7 @@ void _PG_fini(void) {
   shmem_startup_hook = prev_shmem_startup_hook;
   ExecutorCheckPerms_hook = prev_check_perms_hook;
   ProcessUtility_hook = next_ProcessUtility_hook;
+  ExecutorEnd_hook = prev_ExecutorEnd_hook;
 }
 
 static bool collect_relaccess_hook(List *rangeTable,
@@ -174,26 +211,19 @@ static bool collect_relaccess_hook(List *rangeTable,
   if (Gp_role != GP_ROLE_DISPATCH) {
     return true;
   }
-  MemoryContext oldcontext;
-  oldcontext = MemoryContextSwitchTo(TopTransactionContext);
   ListCell *l;
   foreach (l, rangeTable) {
     RangeTblEntry *rte = (RangeTblEntry *)lfirst(l);
     if (rte->rtekind != RTE_RELATION) {
       continue;
     }
-    Oid relOid = rte->relid;
+    Oid relid = rte->relid;
     AclMode requiredPerms = rte->requiredPerms;
     if (requiredPerms &
         (ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) {
-      accessRecord *record = palloc(sizeof(accessRecord));
-      record->when = GetCurrentTimestamp();
-      record->relid = relOid;
-      record->privs = requiredPerms;
-      cached_entries = lappend(cached_entries, record);
+      memorize_local_access_entry(relid, requiredPerms);
     }
   }
-  MemoryContextSwitchTo(oldcontext);
   return true;
 }
 
@@ -216,11 +246,7 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
       RangeVar *rv = lfirst(cell);
       Relation rel;
       rel = heap_openrv(rv, AccessExclusiveLock);
-      accessRecord *record = palloc(sizeof(accessRecord));
-      record->when = GetCurrentTimestamp();
-      record->relid = rel->rd_id;
-      record->privs = ACL_TRUNCATE;
-      cached_entries = lappend(cached_entries, record);
+      memorize_local_access_entry(rel->rd_id, ACL_TRUNCATE);
       heap_close(rel, NoLock);
     }
     MemoryContextSwitchTo(oldcontext);
@@ -235,57 +261,64 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
 }
 
 #define UPDATE_STAT(lowercase, uppercase)                                      \
-  entry->n_##lowercase += (record->privs & ACL_##uppercase ? 1 : 0)
+  dst_entry->n_##lowercase += (src_entry->perms & ACL_##uppercase ? 1 : 0)
 
 static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
   if (Gp_role != GP_ROLE_DISPATCH) {
     return;
   }
-  if (cached_entries == NIL) {
-    return;
-  }
   Assert(GetCurrentTransactionNestLevel == 1);
   if (event == XACT_EVENT_COMMIT) {
-    ListCell *l;
-    foreach (l, cached_entries) {
-      accessRecord *record = (accessRecord *)lfirst(l);
+    HASH_SEQ_STATUS hash_seq;
+    localAccessEntry *src_entry;
+    hash_seq_init(&hash_seq, local_access_entries);
+    while ((src_entry = hash_seq_search(&hash_seq)) != NULL) {
       LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
       bool found;
       relaccessHashKey key;
       key.dbid = MyDatabaseId;
-      key.relid = record->relid;
-      relaccessEntry *entry =
+      key.relid = src_entry->key.relid;
+      relaccessEntry *dst_entry =
           (relaccessEntry *)hash_search(relaccesses, &key, HASH_ENTER, &found);
       if (!found) {
-        entry->key = key;
-        entry->userid = GetUserId();
-        entry->last_read = 0;
-        entry->last_write = 0;
-        entry->n_select = 0;
-        entry->n_insert = 0;
-        entry->n_update = 0;
-        entry->n_delete = 0;
-        entry->n_truncate = 0;
+        dst_entry->key = key;
+        dst_entry->userid = GetUserId();
+        dst_entry->last_read = 0;
+        dst_entry->last_write = 0;
+        dst_entry->n_select = 0;
+        dst_entry->n_insert = 0;
+        dst_entry->n_update = 0;
+        dst_entry->n_delete = 0;
+        dst_entry->n_truncate = 0;
       }
       UPDATE_STAT(select, SELECT);
       UPDATE_STAT(insert, INSERT);
       UPDATE_STAT(update, UPDATE);
       UPDATE_STAT(delete, DELETE);
       UPDATE_STAT(truncate, TRUNCATE);
-      if (record->privs & (ACL_SELECT)) {
-        entry->last_read = Max(GetCurrentTimestamp(), entry->last_read);
+      if (src_entry->perms & (ACL_SELECT)) {
+        dst_entry->last_read = Max(GetCurrentTimestamp(), dst_entry->last_read);
       }
-      if (record->privs &
+      if (src_entry->perms &
           (ACL_INSERT | ACL_DELETE | ACL_UPDATE | ACL_TRUNCATE)) {
-        entry->last_write = Max(GetCurrentTimestamp(), entry->last_write);
+        dst_entry->last_write =
+            Max(GetCurrentTimestamp(), dst_entry->last_write);
       }
       LWLockRelease(data->relaccess_ht_lock);
+      hash_search(local_access_entries, &src_entry->key, HASH_REMOVE, &found);
+      Assert(found);
     }
-    list_free_deep(cached_entries);
-    cached_entries = NIL;
   } else if (event == XACT_EVENT_ABORT) {
-    list_free_deep(cached_entries);
-    cached_entries = NIL;
+    // if there is a better way to cleanup a hashtable w/o recreating it, I
+    // didn't find it
+    HASH_SEQ_STATUS hash_seq;
+    localAccessEntry *src_entry;
+    hash_seq_init(&hash_seq, local_access_entries);
+    while ((src_entry = hash_seq_search(&hash_seq)) != NULL) {
+      bool found;
+      hash_search(local_access_entries, &src_entry->key, HASH_REMOVE, &found);
+      Assert(found);
+    }
   }
 }
 
@@ -393,4 +426,32 @@ static void recover_leftover_dump() {
   relaccess_upsert_from_file();
   FreeFile(f);
   unlink(DUMP_FILENAME);
+}
+
+static void memorize_local_access_entry(Oid relid, AclMode perms) {
+  bool found;
+  localAccessKey key;
+  key.stmt_cnt = stmt_counter;
+  key.relid = relid;
+  localAccessEntry *entry = (localAccessEntry *)hash_search(
+      local_access_entries, &key, HASH_ENTER, &found);
+  if (!found) {
+    entry->key = key;
+    entry->when = GetCurrentTimestamp();
+    entry->perms = perms;
+  } else {
+    entry->perms |= perms;
+  }
+}
+
+static void relaccess_executor_end_hook(QueryDesc *query_desc) {
+  if (prev_ExecutorEnd_hook) {
+    prev_ExecutorEnd_hook(query_desc);
+  } else {
+    standard_ExecutorEnd(query_desc);
+  }
+  // Unfortunately, we cannot safely rely on gp_command_counter as
+  // it is being incremented more than once for many statements.
+  // So we have to maintain our own statement counter.
+  stmt_counter++;
 }
