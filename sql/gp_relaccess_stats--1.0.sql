@@ -20,3 +20,34 @@ CREATE FUNCTION relaccess_stats_update()
 RETURNS void
 AS 'MODULE_PATHNAME', 'relaccess_stats_update'
 LANGUAGE C EXECUTE ON MASTER;
+
+CREATE FUNCTION __relaccess_upsert_from_dump_file(path varchar) RETURNS VOID
+LANGUAGE plpgsql VOLATILE EXECUTE ON MASTER AS
+$func$
+BEGIN
+    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_update_tmp';
+    
+    EXECUTE 'CREATE TEMP TABLE relaccess_stats_update_tmp (LIKE relaccess_stats) distributed by (dbid, relid)';
+    
+    EXECUTE format('COPY relaccess_stats_update_tmp FROM ''%s'' WITH (FORMAT ''csv'', DELIMITER '','')', $1);
+    
+    EXECUTE 'INSERT INTO relaccess_stats 
+        SELECT dbid, relid, userid, last_read, last_write, 0, 0, 0, 0, 0 FROM relaccess_stats_update_tmp stage 
+        WHERE NOT EXISTS (
+            SELECT 1 FROM relaccess_stats orig WHERE orig.dbid = stage.dbid AND orig.relid = stage.relid)';
+    
+    EXECUTE 'UPDATE relaccess_stats orig SET 
+        userid = stage.userid,
+        last_read = stage.last_read,
+        last_write = stage.last_write,
+        n_select_queries = orig.n_select_queries + stage.n_select_queries,
+        n_insert_queries = orig.n_insert_queries + stage.n_insert_queries,
+        n_update_queries = orig.n_update_queries + stage.n_update_queries,
+        n_delete_queries = orig.n_delete_queries + stage.n_delete_queries,
+        n_truncate_queries = orig.n_truncate_queries + stage.n_truncate_queries 
+    FROM relaccess_stats_update_tmp stage
+        WHERE orig.dbid = stage.dbid AND orig.relid = stage.relid';
+    
+    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_update_tmp';
+END
+$func$;
