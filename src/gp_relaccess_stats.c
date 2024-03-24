@@ -7,6 +7,7 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "pg_config_ext.h"
+#include "pgstat.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -27,7 +28,8 @@ void _PG_fini(void);
 PG_FUNCTION_INFO_V1(relaccess_stats_update);
 
 static void relaccess_stats_update_internal(void);
-static void relaccess_dump_to_file(void);
+static void relaccess_dump_to_files(bool only_this_db);
+static void relaccess_dump_to_files_internal(HTAB *files);
 static void relaccess_upsert_from_file(void);
 static void recover_leftover_dump(void);
 static void relaccess_shmem_startup(void);
@@ -37,9 +39,6 @@ static int relaccess_match_fn(const void *key1, const void *key2, Size keysize);
 static uint32 local_relaccess_hash_fn(const void *key, Size keysize);
 static int local_relaccess_match_fn(const void *key1, const void *key2,
                                     Size keysize);
-static uint32 relnamecache_hash_fn(const void *key, Size keysize);
-static int relnamecache_match_fn(const void *key1, const void *key2,
-                                 Size keysize);
 static bool collect_relaccess_hook(List *rangeTable, bool ereport_on_violation);
 static void relaccess_xact_callback(XactEvent event, void *arg);
 static void collect_truncate_hook(Node *parsetree, const char *queryString,
@@ -49,6 +48,7 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
 static void relaccess_executor_end_hook(QueryDesc *query_desc);
 static void memorize_local_access_entry(Oid relid, AclMode perms);
 static void update_relname_cache(Oid relid, char *relname);
+static StringInfoData get_dump_filename(Oid dbid);
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorCheckPerms_hook_type prev_check_perms_hook = NULL;
@@ -94,6 +94,12 @@ typedef struct relnameCacheEntry {
   char *relname;
 } relnameCacheEntry;
 
+typedef struct fileDumpEntry {
+  Oid dbid;
+  char *filename;
+  FILE *file;
+} fileDumpEntry;
+
 static relaccessGlobalData *data;
 static HTAB *relaccesses;
 static const int32 RELACCESS_MAX = 100000;
@@ -101,9 +107,8 @@ static HTAB *local_access_entries = NULL;
 static const int32 LOCAL_HTAB_SZ = 128;
 static HTAB *relname_cache = NULL;
 static const int32 RELCACHE_SZ = 16;
+static const int32 FILE_CACHE_SZ = 16;
 static int stmt_counter = 0;
-
-static const char *const DUMP_FILENAME = "relaccess_stats_dump.csv";
 
 #define IS_POSTGRES_DB                                                         \
   (strcmp("postgres", get_database_name(MyDatabaseId)) == 0)
@@ -145,7 +150,7 @@ static void relaccess_shmem_shutdown(int code, Datum arg) {
     return;
   }
   LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
-  relaccess_dump_to_file();
+  relaccess_dump_to_files(false);
   LWLockRelease(data->relaccess_file_lock);
 }
 
@@ -171,18 +176,6 @@ static int local_relaccess_match_fn(const void *key1, const void *key2,
   const localAccessKey *k1 = (const localAccessKey *)key1;
   const localAccessKey *k2 = (const localAccessKey *)key2;
   return (k1->stmt_cnt == k2->stmt_cnt && k1->relid == k2->relid ? 0 : 1);
-}
-
-static uint32 relnamecache_hash_fn(const void *key, Size keysize) {
-  const Oid *k = (const Oid *)key;
-  return hash_uint32((uint32)(*k));
-}
-
-static int relnamecache_match_fn(const void *key1, const void *key2,
-                                 Size keysize) {
-  const Oid *k1 = (const Oid *)key1;
-  const Oid *k2 = (const Oid *)key2;
-  return (*k1 == *k2 ? 0 : 1);
 }
 
 void _PG_init(void) {
@@ -219,11 +212,9 @@ void _PG_init(void) {
   MemSet(&ctl, 0, sizeof(ctl));
   ctl.keysize = sizeof(Oid);
   ctl.entrysize = sizeof(relnameCacheEntry);
-  ctl.hash = relnamecache_hash_fn;
-  ctl.match = relnamecache_match_fn;
-  relname_cache =
-      hash_create("Transaction-wide relation name cache", RELCACHE_SZ, &ctl,
-                  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+  ctl.hash = oid_hash;
+  relname_cache = hash_create("Transaction-wide relation name cache",
+                              RELCACHE_SZ, &ctl, HASH_ELEM | HASH_FUNCTION);
 }
 
 void _PG_fini(void) {
@@ -376,26 +367,61 @@ Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
 }
 
 static void relaccess_stats_update_internal() {
-  if (!IS_POSTGRES_DB) {
-    elog(WARNING, "relaccess_stats_update should only ever be called from "
-                  "'postgres' database");
-    return;
-  }
   LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   recover_leftover_dump();
-  relaccess_dump_to_file();
+  relaccess_dump_to_files(true);
   relaccess_upsert_from_file();
-  unlink(DUMP_FILENAME);
+  StringInfoData filename = get_dump_filename(MyDatabaseId);
+  unlink(filename.data);
+  pfree(filename.data);
   LWLockRelease(data->relaccess_file_lock);
 }
 
-static void relaccess_dump_to_file() {
-  unlink(DUMP_FILENAME);
-  FILE *file = AllocateFile(DUMP_FILENAME, "wt");
-  if (file == NULL) {
-    // TODO: handle
+static void add_file_dump_entry(Oid dbid, HTAB *ht) {
+  bool found;
+  fileDumpEntry *file_entry = hash_search(ht, &dbid, HASH_ENTER, &found);
+  if (!found) {
+    file_entry->dbid = dbid;
+    StringInfoData filename = get_dump_filename(file_entry->dbid);
+    file_entry->filename = filename.data;
+    unlink(file_entry->filename);
+    file_entry->file = AllocateFile(file_entry->filename, "wt");
   }
+}
+
+static void relaccess_dump_to_files(bool only_this_db) {
+  HTAB *file_mapping;
+  HASHCTL ctl;
+  MemSet(&ctl, 0, sizeof(ctl));
+  ctl.keysize = sizeof(Oid);
+  ctl.entrysize = sizeof(fileDumpEntry);
+  ctl.hash = oid_hash;
+  file_mapping = hash_create("Relaccess dump files", FILE_CACHE_SZ, &ctl,
+                             HASH_ELEM | HASH_FUNCTION);
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+  if (only_this_db) {
+    add_file_dump_entry(MyDatabaseId, file_mapping);
+  } else {
+    HASH_SEQ_STATUS hash_seq;
+    relaccessEntry *access_entry;
+    hash_seq_init(&hash_seq, relaccesses);
+    while ((access_entry = hash_seq_search(&hash_seq)) != NULL) {
+      add_file_dump_entry(access_entry->key.dbid, file_mapping);
+    }
+  }
+  relaccess_dump_to_files_internal(file_mapping);
+  LWLockRelease(data->relaccess_ht_lock);
+  HASH_SEQ_STATUS hash_seq;
+  hash_seq_init(&hash_seq, file_mapping);
+  fileDumpEntry *entry;
+  while ((entry = hash_seq_search(&hash_seq)) != NULL) {
+    FreeFile(entry->file);
+    pfree(entry->filename);
+  }
+  hash_destroy(file_mapping);
+}
+
+static void relaccess_dump_to_files_internal(HTAB *files) {
   // Dump to tmp .csv file and clear the HT
   HASH_SEQ_STATUS hash_seq;
   relaccessEntry *entry;
@@ -406,16 +432,22 @@ static void relaccess_dump_to_file() {
   char read_time_buf[MAXDATELEN + 1];
   char write_time_buf[MAXDATELEN + 1];
   while ((entry = hash_seq_search(&hash_seq)) != NULL) {
+    bool found;
+    fileDumpEntry *dumpfile = hash_search(files, &entry->key.dbid, HASH_ENTER_NULL, &found);
+    if (!found) {
+      // ignore this dbid
+      continue;
+    }
     strncpy(read_time_buf, timestamptz_to_str(entry->last_read), MAXDATELEN);
     strncpy(write_time_buf, timestamptz_to_str(entry->last_write), MAXDATELEN);
     read_time_buf[MAXDATELEN] = 0;
     write_time_buf[MAXDATELEN] = 0;
     appendStringInfo(
-        &entry_csv_line, "%d,%d,\"%s\",%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
-        entry->key.dbid, entry->key.relid, entry->relname.data, entry->userid,
-        read_time_buf, write_time_buf, entry->n_select, entry->n_insert,
-        entry->n_update, entry->n_delete, entry->n_truncate);
-    if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, file) !=
+        &entry_csv_line, "%d,\"%s\",%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
+        entry->key.relid, entry->relname.data, entry->userid, read_time_buf,
+        write_time_buf, entry->n_select, entry->n_insert, entry->n_update,
+        entry->n_delete, entry->n_truncate);
+    if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, dumpfile->file) !=
         entry_csv_line.len) {
       hash_seq_term(&hash_seq);
       // TODO: handle
@@ -425,30 +457,35 @@ static void relaccess_dump_to_file() {
     // TODO: figure out a safer way to remove entries from HT.
     // If for some reason we fail upserting dumped data somewhere later
     // those stats are forever lost for us
-    bool found;
     hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
     Assert(found);
   }
-  LWLockRelease(data->relaccess_ht_lock);
-  FreeFile(file);
 }
 
 static void relaccess_upsert_from_file() {
   SPI_connect();
-  SPI_execute(
-      "SELECT __relaccess_upsert_from_dump_file('relaccess_stats_dump.csv')",
-      false, 1);
+  StringInfoData filename = get_dump_filename(MyDatabaseId);
+  StringInfoData query;
+  initStringInfo(&query);
+  appendStringInfo(&query, "SELECT __relaccess_upsert_from_dump_file('%s')",
+                   filename.data);
+  SPI_execute(query.data, false, 1);
   SPI_finish();
+  pfree(filename.data);
+  pfree(query.data);
 }
 
 static void recover_leftover_dump() {
-  FILE *f = AllocateFile(DUMP_FILENAME, "rt");
+  StringInfoData filename = get_dump_filename(MyDatabaseId);
+  FILE *f = AllocateFile(filename.data, "rt");
   if (f == NULL) {
+    pfree(filename.data);
     return;
   }
   relaccess_upsert_from_file();
   FreeFile(f);
-  unlink(DUMP_FILENAME);
+  unlink(filename.data);
+  pfree(filename.data);
 }
 
 static void update_relname_cache(Oid relid, char *relname) {
@@ -508,4 +545,12 @@ static void relaccess_executor_end_hook(QueryDesc *query_desc) {
   // it is being incremented more than once for many statements.
   // So we have to maintain our own statement counter.
   stmt_counter++;
+}
+
+static StringInfoData get_dump_filename(Oid dbid) {
+  StringInfoData filename;
+  initStringInfoOfSize(&filename, 256);
+  appendStringInfo(&filename, "%s/relaccess_stats_dump_%d.csv",
+                   PGSTAT_STAT_PERMANENT_DIRECTORY, dbid);
+  return filename;
 }
