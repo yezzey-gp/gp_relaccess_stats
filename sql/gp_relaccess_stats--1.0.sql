@@ -52,3 +52,13 @@ BEGIN
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_update_tmp';
 END
 $func$;
+
+CREATE FUNCTION relaccess_stats_init() RETURNS VOID AS
+$$
+    WITH relations AS (
+        SELECT oid as relid, relname, relowner FROM pg_catalog.pg_class WHERE relkind in ('r', 'v', 'm', 'f', 'p')
+    )
+    INSERT INTO relaccess_stats
+        SELECT relid, relname, relowner, '2000-01-01 03:00:00', '2000-01-01 03:00:00', 0, 0, 0, 0, 0
+        FROM relations AS all_rels WHERE NOT EXISTS(SELECT 1 FROM relaccess_stats orig WHERE orig.relid = all_rels.relid);
+$$ LANGUAGE SQL VOLATILE EXECUTE ON MASTER;
