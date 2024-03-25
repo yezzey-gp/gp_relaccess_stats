@@ -1,6 +1,8 @@
 #include "postgres.h"
 #include "access/xact.h"
 #include "access/hash.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_database.h"
 #include "cdb/cdbvars.h"
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
@@ -46,6 +48,8 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
                                   ParamListInfo params, DestReceiver *dest,
                                   char *completionTag);
 static void relaccess_executor_end_hook(QueryDesc *query_desc);
+static void relaccess_drop_hook(ObjectAccessType access, Oid classId,
+                                Oid objectId, int subId, void *arg);
 static void memorize_local_access_entry(Oid relid, AclMode perms);
 static void update_relname_cache(Oid relid, char *relname);
 static StringInfoData get_dump_filename(Oid dbid);
@@ -54,6 +58,7 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorCheckPerms_hook_type prev_check_perms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
+static object_access_hook_type prev_object_access_hook = NULL;
 
 typedef struct relaccessHashKey {
   Oid dbid;
@@ -194,6 +199,8 @@ void _PG_init(void) {
   ProcessUtility_hook = collect_truncate_hook;
   prev_ExecutorEnd_hook = ExecutorEnd_hook;
   ExecutorEnd_hook = relaccess_executor_end_hook;
+  prev_object_access_hook = object_access_hook;
+  object_access_hook = relaccess_drop_hook;
   RequestAddinLWLocks(2);
   size = MAXALIGN(sizeof(relaccessGlobalData));
   size =
@@ -225,6 +232,7 @@ void _PG_fini(void) {
   ExecutorCheckPerms_hook = prev_check_perms_hook;
   ProcessUtility_hook = next_ProcessUtility_hook;
   ExecutorEnd_hook = prev_ExecutorEnd_hook;
+  object_access_hook = prev_object_access_hook;
 }
 
 static bool collect_relaccess_hook(List *rangeTable,
@@ -432,7 +440,8 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
   char write_time_buf[MAXDATELEN + 1];
   while ((entry = hash_seq_search(&hash_seq)) != NULL) {
     bool found;
-    fileDumpEntry *dumpfile = hash_search(files, &entry->key.dbid, HASH_ENTER_NULL, &found);
+    fileDumpEntry *dumpfile =
+        hash_search(files, &entry->key.dbid, HASH_ENTER_NULL, &found);
     if (!found) {
       // ignore this dbid
       continue;
@@ -552,4 +561,29 @@ static StringInfoData get_dump_filename(Oid dbid) {
   appendStringInfo(&filename, "%s/relaccess_stats_dump_%d.csv",
                    PGSTAT_STAT_PERMANENT_DIRECTORY, dbid);
   return filename;
+}
+
+static void relaccess_drop_hook(ObjectAccessType access, Oid classId,
+                                Oid objectId, int subId, void *arg) {
+  if (prev_object_access_hook) {
+    prev_object_access_hook(access, classId, objectId, subId, arg);
+  }
+  if (classId == DatabaseRelationId && access == OAT_DROP) {
+    LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+    HASH_SEQ_STATUS hash_seq;
+    relaccessEntry *entry;
+    hash_seq_init(&hash_seq, relaccesses);
+    while ((entry = hash_seq_search(&hash_seq)) != NULL) {
+      if (entry->key.dbid == objectId) {
+        bool found;
+        hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
+      }
+    }
+    LWLockRelease(data->relaccess_ht_lock);
+    LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
+    StringInfoData filename = get_dump_filename(objectId);
+    unlink(filename.data);
+    pfree(filename.data);
+    LWLockRelease(data->relaccess_file_lock);
+  }
 }
