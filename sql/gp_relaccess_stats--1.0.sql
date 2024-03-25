@@ -25,17 +25,33 @@ CREATE FUNCTION __relaccess_upsert_from_dump_file(path varchar) RETURNS VOID
 LANGUAGE plpgsql VOLATILE EXECUTE ON MASTER AS
 $func$
 BEGIN
-    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_update_tmp';
-
-    EXECUTE 'CREATE TEMP TABLE relaccess_stats_update_tmp (LIKE relaccess_stats) distributed by (relid)';
-
-    EXECUTE format('COPY relaccess_stats_update_tmp FROM ''%s'' WITH (FORMAT ''csv'', DELIMITER '','')', $1);
-
+    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp';
+    EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp (LIKE relaccess_stats) distributed by (relid)';
+    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp_aggregated';
+    EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp_aggregated (LIKE relaccess_stats) distributed by (relid)';
+    EXECUTE format('COPY relaccess_stats_tmp FROM ''%s'' WITH (FORMAT ''csv'', DELIMITER '','')', $1);
+    EXECUTE 'WITH aggregated_wo_relname_and_user AS (
+        SELECT relid, max(last_read) AS last_read, max(last_write) AS last_write, sum(n_select_queries) AS n_select_queries,
+            sum(n_insert_queries) AS n_insert_queries, sum(n_update_queries) AS n_update_queries, sum(n_delete_queries) AS n_delete_queries, sum(n_truncate_queries) AS n_truncate_queries
+        FROM relaccess_stats_tmp GROUP BY relid
+    )
+    INSERT INTO relaccess_stats_tmp_aggregated
+    SELECT relid,
+        (SELECT relname FROM relaccess_stats_tmp w WHERE w.relid = wo.relid AND greatest(wo.last_read, wo.last_write) IN (w.last_read, w.last_write) LIMIT 1) AS relname,
+        (SELECT last_user_id FROM relaccess_stats_tmp w WHERE w.relid = wo.relid AND greatest(wo.last_read, wo.last_write) IN (w.last_read, w.last_write) LIMIT 1) AS last_user_id,
+        last_read,
+        last_write,
+        n_select_queries,
+        n_insert_queries,
+        n_update_queries,
+        n_delete_queries,
+        n_truncate_queries FROM aggregated_wo_relname_and_user AS wo';
+    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp';
     EXECUTE 'INSERT INTO relaccess_stats
-        SELECT relid, relname, last_user_id, last_read, last_write, 0, 0, 0, 0, 0 FROM relaccess_stats_update_tmp stage
+        SELECT relid, relname, last_user_id, last_read, last_write, 0, 0, 0, 0, 0
+        FROM relaccess_stats_tmp_aggregated stage
         WHERE NOT EXISTS (
             SELECT 1 FROM relaccess_stats orig WHERE orig.relid = stage.relid)';
-
     EXECUTE 'UPDATE relaccess_stats orig SET
         relname = stage.relname,
         last_user_id = stage.last_user_id,
@@ -46,10 +62,9 @@ BEGIN
         n_update_queries = orig.n_update_queries + stage.n_update_queries,
         n_delete_queries = orig.n_delete_queries + stage.n_delete_queries,
         n_truncate_queries = orig.n_truncate_queries + stage.n_truncate_queries
-    FROM relaccess_stats_update_tmp stage
+    FROM relaccess_stats_tmp_aggregated stage
         WHERE orig.relid = stage.relid';
-
-    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_update_tmp';
+    EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp_aggregated';
 END
 $func$;
 

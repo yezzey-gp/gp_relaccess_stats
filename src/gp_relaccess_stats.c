@@ -384,8 +384,7 @@ static void add_file_dump_entry(Oid dbid, HTAB *ht) {
     file_entry->dbid = dbid;
     StringInfoData filename = get_dump_filename(file_entry->dbid);
     file_entry->filename = filename.data;
-    unlink(file_entry->filename);
-    file_entry->file = AllocateFile(file_entry->filename, "wt");
+    file_entry->file = AllocateFile(file_entry->filename, "at");
   }
 }
 
