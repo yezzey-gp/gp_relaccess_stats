@@ -33,7 +33,6 @@ static void relaccess_stats_update_internal(void);
 static void relaccess_dump_to_files(bool only_this_db);
 static void relaccess_dump_to_files_internal(HTAB *files);
 static void relaccess_upsert_from_file(void);
-static void recover_leftover_dump(void);
 static void relaccess_shmem_startup(void);
 static void relaccess_shmem_shutdown(int code, Datum arg);
 static uint32 relaccess_hash_fn(const void *key, Size keysize);
@@ -429,7 +428,6 @@ Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
 
 static void relaccess_stats_update_internal() {
   LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
-  recover_leftover_dump();
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(true);
   LWLockRelease(data->relaccess_ht_lock);
@@ -535,19 +533,6 @@ static void relaccess_upsert_from_file() {
   SPI_finish();
   pfree(filename.data);
   pfree(query.data);
-}
-
-static void recover_leftover_dump() {
-  StringInfoData filename = get_dump_filename(MyDatabaseId);
-  FILE *f = AllocateFile(filename.data, "rt");
-  if (f == NULL) {
-    pfree(filename.data);
-    return;
-  }
-  relaccess_upsert_from_file();
-  FreeFile(f);
-  unlink(filename.data);
-  pfree(filename.data);
 }
 
 static void update_relname_cache(Oid relid, char *relname) {
