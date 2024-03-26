@@ -105,8 +105,9 @@ typedef struct fileDumpEntry {
   FILE *file;
 } fileDumpEntry;
 
-static int32 guc_relaccess_size;
-static bool guc_dump_on_overflow;
+static int32 relaccess_size;
+static bool dump_on_overflow;
+static bool is_enabled;
 static relaccessGlobalData *data;
 static HTAB *relaccesses;
 static HTAB *local_access_entries = NULL;
@@ -141,9 +142,9 @@ static void relaccess_shmem_startup() {
   info.entrysize = sizeof(relaccessEntry);
   info.hash = relaccess_hash_fn;
   info.match = relaccess_match_fn;
-  relaccesses = ShmemInitHash("relaccess_stats hash", guc_relaccess_size,
-                              guc_relaccess_size, &info,
-                              HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+  relaccesses =
+      ShmemInitHash("relaccess_stats hash", relaccess_size, relaccess_size,
+                    &info, HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
   LWLockRelease(AddinShmemInitLock);
 
@@ -199,14 +200,20 @@ void _PG_init(void) {
   DefineCustomIntVariable(
       "gp_relaccess_stats.max_tables",
       "Sets the maximum number of tables cached by gp_relaccess_stats.", NULL,
-      &guc_relaccess_size, 65536, 128, INT_MAX, PGC_POSTMASTER, 0, NULL, NULL,
+      &relaccess_size, 65536, 128, INT_MAX, PGC_POSTMASTER, 0, NULL, NULL,
       NULL);
 
   DefineCustomBoolVariable("gp_relaccess_stats.dump_on_overflow",
                            "Selects whether we should dump to .csv in case "
                            "gp_relaccess_stats.max_tables is exceeded.",
-                           NULL, &guc_dump_on_overflow, false, PGC_SIGHUP, 0,
-                           NULL, NULL, NULL);
+                           NULL, &dump_on_overflow, false, PGC_SIGHUP, 0, NULL,
+                           NULL, NULL);
+
+  DefineCustomBoolVariable(
+      "gp_relaccess_stats.enabled",
+      "Collect table access stats globally or for a specific database. "
+      "Note that shared memory is initialized indepemdent of this argument.",
+      NULL, &is_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
   prev_shmem_startup_hook = shmem_startup_hook;
   shmem_startup_hook = relaccess_shmem_startup;
@@ -220,8 +227,8 @@ void _PG_init(void) {
   object_access_hook = relaccess_drop_hook;
   RequestAddinLWLocks(2);
   size = MAXALIGN(sizeof(relaccessGlobalData));
-  size = add_size(
-      size, hash_estimate_size(guc_relaccess_size, sizeof(relaccessEntry)));
+  size = add_size(size,
+                  hash_estimate_size(relaccess_size, sizeof(relaccessEntry)));
   RequestAddinShmemSpace(size);
   RegisterXactCallback(relaccess_xact_callback, NULL);
   HASHCTL ctl;
@@ -258,21 +265,20 @@ static bool collect_relaccess_hook(List *rangeTable,
       !prev_check_perms_hook(rangeTable, ereport_on_violation)) {
     return false;
   }
-  if (Gp_role != GP_ROLE_DISPATCH) {
-    return true;
-  }
-  ListCell *l;
-  foreach (l, rangeTable) {
-    RangeTblEntry *rte = (RangeTblEntry *)lfirst(l);
-    if (rte->rtekind != RTE_RELATION) {
-      continue;
-    }
-    Oid relid = rte->relid;
-    AclMode requiredPerms = rte->requiredPerms;
-    if (requiredPerms &
-        (ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) {
-      memorize_local_access_entry(relid, requiredPerms);
-      update_relname_cache(relid, NULL);
+  if (Gp_role == GP_ROLE_DISPATCH && is_enabled) {
+    ListCell *l;
+    foreach (l, rangeTable) {
+      RangeTblEntry *rte = (RangeTblEntry *)lfirst(l);
+      if (rte->rtekind != RTE_RELATION) {
+        continue;
+      }
+      Oid relid = rte->relid;
+      AclMode requiredPerms = rte->requiredPerms;
+      if (requiredPerms &
+          (ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) {
+        memorize_local_access_entry(relid, requiredPerms);
+        update_relname_cache(relid, NULL);
+      }
     }
   }
   return true;
@@ -282,7 +288,8 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
                                   ProcessUtilityContext context,
                                   ParamListInfo params, DestReceiver *dest,
                                   char *completionTag) {
-  if (nodeTag(parsetree) == T_TruncateStmt) {
+  if (nodeTag(parsetree) == T_TruncateStmt && is_enabled &&
+      Gp_role == GP_ROLE_DISPATCH) {
     MemoryContext oldcontext;
     oldcontext = MemoryContextSwitchTo(TopTransactionContext);
     TruncateStmt *stmt = (TruncateStmt *)parsetree;
@@ -330,7 +337,7 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
   }
 
 static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
-  if (Gp_role != GP_ROLE_DISPATCH) {
+  if (Gp_role != GP_ROLE_DISPATCH || !is_enabled) {
     return;
   }
   Assert(GetCurrentTransactionNestLevel == 1);
@@ -346,15 +353,15 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
       key.relid = src_entry->key.relid;
       long n_access_records = hash_get_num_entries(relaccesses);
       relaccessEntry *dst_entry = NULL;
-      Assert(n_access_records <= guc_relaccess_size);
-      if (n_access_records == guc_relaccess_size) {
+      Assert(n_access_records <= relaccess_size);
+      if (n_access_records == relaccess_size) {
         dst_entry =
             (relaccessEntry *)hash_search(relaccesses, &key, HASH_FIND, &found);
       } else {
         dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
                                                   HASH_ENTER_NULL, &found);
       }
-      if (dst_entry || guc_dump_on_overflow) {
+      if (dst_entry || dump_on_overflow) {
         if (!dst_entry) {
           // TODO: figure out the right locking scheme. For now we're safe here,
           // as whenever we hold relaccess_ht_lock we also hold the file lock.
