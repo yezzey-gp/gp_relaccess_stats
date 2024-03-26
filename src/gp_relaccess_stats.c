@@ -156,11 +156,11 @@ static void relaccess_shmem_shutdown(int code, Datum arg) {
   if (code || !data || !relaccesses) {
     return;
   }
-  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(false);
-  LWLockRelease(data->relaccess_ht_lock);
   LWLockRelease(data->relaccess_file_lock);
+  LWLockRelease(data->relaccess_ht_lock);
 }
 
 static uint32 relaccess_hash_fn(const void *key, Size keysize) {
@@ -362,10 +362,9 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
       }
       if (dst_entry || dump_on_overflow) {
         if (!dst_entry) {
-          // TODO: figure out the right locking scheme. For now we're safe here,
-          // as whenever we hold relaccess_ht_lock we also hold the file lock.
-          // But it might change. Hence, this line needs to be fixed
+          LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
           relaccess_dump_to_files(false);
+          LWLockRelease(data->relaccess_file_lock);
           // we MUST have enough space now
           dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
                                                     HASH_ENTER_NULL, &found);
@@ -427,10 +426,12 @@ Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
 }
 
 static void relaccess_stats_update_internal() {
-  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(true);
   LWLockRelease(data->relaccess_ht_lock);
+  LWLockRelease(data->relaccess_file_lock);
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_upsert_from_file();
   StringInfoData filename = get_dump_filename(MyDatabaseId);
   unlink(filename.data);
