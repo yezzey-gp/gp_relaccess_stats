@@ -105,15 +105,17 @@ typedef struct fileDumpEntry {
   FILE *file;
 } fileDumpEntry;
 
+static int32 guc_relaccess_size;
+static bool guc_dump_on_overflow;
 static relaccessGlobalData *data;
 static HTAB *relaccesses;
-static const int32 RELACCESS_MAX = 100000;
 static HTAB *local_access_entries = NULL;
 static const int32 LOCAL_HTAB_SZ = 128;
 static HTAB *relname_cache = NULL;
 static const int32 RELCACHE_SZ = 16;
 static const int32 FILE_CACHE_SZ = 16;
 static int stmt_counter = 0;
+static bool had_ht_overflow = false;
 
 #define IS_POSTGRES_DB                                                         \
   (strcmp("postgres", get_database_name(MyDatabaseId)) == 0)
@@ -139,9 +141,9 @@ static void relaccess_shmem_startup() {
   info.entrysize = sizeof(relaccessEntry);
   info.hash = relaccess_hash_fn;
   info.match = relaccess_match_fn;
-  relaccesses =
-      ShmemInitHash("relaccess_stats hash", RELACCESS_MAX, RELACCESS_MAX, &info,
-                    HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+  relaccesses = ShmemInitHash("relaccess_stats hash", guc_relaccess_size,
+                              guc_relaccess_size, &info,
+                              HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
   LWLockRelease(AddinShmemInitLock);
 
@@ -155,7 +157,9 @@ static void relaccess_shmem_shutdown(int code, Datum arg) {
     return;
   }
   LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
+  LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(false);
+  LWLockRelease(data->relaccess_ht_lock);
   LWLockRelease(data->relaccess_file_lock);
 }
 
@@ -191,6 +195,19 @@ void _PG_init(void) {
   if (!process_shared_preload_libraries_in_progress) {
     return;
   }
+
+  DefineCustomIntVariable(
+      "gp_relaccess_stats.max_tables",
+      "Sets the maximum number of tables cached by gp_relaccess_stats.", NULL,
+      &guc_relaccess_size, 65536, 128, INT_MAX, PGC_POSTMASTER, 0, NULL, NULL,
+      NULL);
+
+  DefineCustomBoolVariable("gp_relaccess_stats.dump_on_overflow",
+                           "Selects whether we should dump to .csv in case "
+                           "gp_relaccess_stats.max_tables is exceeded.",
+                           NULL, &guc_dump_on_overflow, false, PGC_SIGHUP, 0,
+                           NULL, NULL, NULL);
+
   prev_shmem_startup_hook = shmem_startup_hook;
   shmem_startup_hook = relaccess_shmem_startup;
   prev_check_perms_hook = ExecutorCheckPerms_hook;
@@ -203,8 +220,8 @@ void _PG_init(void) {
   object_access_hook = relaccess_drop_hook;
   RequestAddinLWLocks(2);
   size = MAXALIGN(sizeof(relaccessGlobalData));
-  size =
-      add_size(size, hash_estimate_size(RELACCESS_MAX, sizeof(relaccessEntry)));
+  size = add_size(
+      size, hash_estimate_size(guc_relaccess_size, sizeof(relaccessEntry)));
   RequestAddinShmemSpace(size);
   RegisterXactCallback(relaccess_xact_callback, NULL);
   HASHCTL ctl;
@@ -327,38 +344,67 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
       relaccessHashKey key;
       key.dbid = MyDatabaseId;
       key.relid = src_entry->key.relid;
-      relaccessEntry *dst_entry =
-          (relaccessEntry *)hash_search(relaccesses, &key, HASH_ENTER, &found);
-      if (!found) {
-        dst_entry->key = key;
-        dst_entry->userid = GetUserId();
-        dst_entry->last_read = 0;
-        dst_entry->last_write = 0;
-        dst_entry->n_select = 0;
-        dst_entry->n_insert = 0;
-        dst_entry->n_update = 0;
-        dst_entry->n_delete = 0;
-        dst_entry->n_truncate = 0;
+      long n_access_records = hash_get_num_entries(relaccesses);
+      relaccessEntry *dst_entry = NULL;
+      Assert(n_access_records <= guc_relaccess_size);
+      if (n_access_records == guc_relaccess_size) {
+        dst_entry =
+            (relaccessEntry *)hash_search(relaccesses, &key, HASH_FIND, &found);
+      } else {
+        dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
+                                                  HASH_ENTER_NULL, &found);
       }
-      UPDATE_STAT(select, SELECT);
-      UPDATE_STAT(insert, INSERT);
-      UPDATE_STAT(update, UPDATE);
-      UPDATE_STAT(delete, DELETE);
-      UPDATE_STAT(truncate, TRUNCATE);
-      if (src_entry->perms & (ACL_SELECT)) {
-        dst_entry->last_read = Max(GetCurrentTimestamp(), dst_entry->last_read);
+      if (dst_entry || guc_dump_on_overflow) {
+        if (!dst_entry) {
+          // TODO: figure out the right locking scheme. For now we're safe here,
+          // as whenever we hold relaccess_ht_lock we also hold the file lock.
+          // But it might change. Hence, this line needs to be fixed
+          relaccess_dump_to_files(false);
+          // we MUST have enough space now
+          dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
+                                                    HASH_ENTER_NULL, &found);
+          Assert(dst_entry != NULL);
+        }
+        if (!found) {
+          dst_entry->key = key;
+          dst_entry->userid = GetUserId();
+          dst_entry->last_read = 0;
+          dst_entry->last_write = 0;
+          dst_entry->n_select = 0;
+          dst_entry->n_insert = 0;
+          dst_entry->n_update = 0;
+          dst_entry->n_delete = 0;
+          dst_entry->n_truncate = 0;
+        }
+        UPDATE_STAT(select, SELECT);
+        UPDATE_STAT(insert, INSERT);
+        UPDATE_STAT(update, UPDATE);
+        UPDATE_STAT(delete, DELETE);
+        UPDATE_STAT(truncate, TRUNCATE);
+        if (src_entry->perms & (ACL_SELECT)) {
+          dst_entry->last_read =
+              Max(GetCurrentTimestamp(), dst_entry->last_read);
+        }
+        if (src_entry->perms &
+            (ACL_INSERT | ACL_DELETE | ACL_UPDATE | ACL_TRUNCATE)) {
+          dst_entry->last_write =
+              Max(GetCurrentTimestamp(), dst_entry->last_write);
+        }
+        relnameCacheEntry *namecache_entry = (relnameCacheEntry *)hash_search(
+            relname_cache, &key.relid, HASH_ENTER, &found);
+        Assert(namecache_entry);
+        strcpy(dst_entry->relname.data, namecache_entry->relname);
+        int namelen = strlen(namecache_entry->relname);
+        dst_entry->relname.data[namelen] = 0;
+      } else {
+        if (!had_ht_overflow) {
+          elog(WARNING, "gp_relaccess_stats.max_tables is exceeded! New table "
+                        "events will be lost. "
+                        "Please execute relaccess_stats_update() and consider "
+                        "setting a hihger value");
+        }
+        had_ht_overflow = true;
       }
-      if (src_entry->perms &
-          (ACL_INSERT | ACL_DELETE | ACL_UPDATE | ACL_TRUNCATE)) {
-        dst_entry->last_write =
-            Max(GetCurrentTimestamp(), dst_entry->last_write);
-      }
-      relnameCacheEntry *namecache_entry = (relnameCacheEntry *)hash_search(
-          relname_cache, &key.relid, HASH_ENTER, &found);
-      Assert(namecache_entry);
-      strcpy(dst_entry->relname.data, namecache_entry->relname);
-      int namelen = strlen(namecache_entry->relname);
-      dst_entry->relname.data[namelen] = 0;
       LWLockRelease(data->relaccess_ht_lock);
       hash_search(local_access_entries, &src_entry->key, HASH_REMOVE, &found);
       Assert(found);
@@ -377,7 +423,9 @@ Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
 static void relaccess_stats_update_internal() {
   LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   recover_leftover_dump();
+  LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(true);
+  LWLockRelease(data->relaccess_ht_lock);
   relaccess_upsert_from_file();
   StringInfoData filename = get_dump_filename(MyDatabaseId);
   unlink(filename.data);
@@ -405,7 +453,6 @@ static void relaccess_dump_to_files(bool only_this_db) {
   ctl.hash = oid_hash;
   file_mapping = hash_create("Relaccess dump files", FILE_CACHE_SZ, &ctl,
                              HASH_ELEM | HASH_FUNCTION);
-  LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
   if (only_this_db) {
     add_file_dump_entry(MyDatabaseId, file_mapping);
   } else {
@@ -417,7 +464,6 @@ static void relaccess_dump_to_files(bool only_this_db) {
     }
   }
   relaccess_dump_to_files_internal(file_mapping);
-  LWLockRelease(data->relaccess_ht_lock);
   HASH_SEQ_STATUS hash_seq;
   hash_seq_init(&hash_seq, file_mapping);
   fileDumpEntry *entry;
@@ -466,6 +512,7 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     // If for some reason we fail upserting dumped data somewhere later
     // those stats are forever lost to us
     hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
+    had_ht_overflow = false;
     Assert(found);
   }
 }
@@ -577,6 +624,7 @@ static void relaccess_drop_hook(ObjectAccessType access, Oid classId,
       if (entry->key.dbid == objectId) {
         bool found;
         hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
+        had_ht_overflow = false;
       }
     }
     LWLockRelease(data->relaccess_ht_lock);
