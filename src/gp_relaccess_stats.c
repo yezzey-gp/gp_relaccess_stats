@@ -353,11 +353,11 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
         dst_entry->last_write =
             Max(GetCurrentTimestamp(), dst_entry->last_write);
       }
-      relnameCacheEntry *relcache_entry = (relnameCacheEntry *)hash_search(
-          relname_cache, &key.relid, HASH_ENTER_NULL, &found);
-      Assert(relcache_entry);
-      strcpy(dst_entry->relname.data, relcache_entry->relname);
-      int namelen = strlen(relcache_entry->relname);
+      relnameCacheEntry *namecache_entry = (relnameCacheEntry *)hash_search(
+          relname_cache, &key.relid, HASH_ENTER, &found);
+      Assert(namecache_entry);
+      strcpy(dst_entry->relname.data, namecache_entry->relname);
+      int namelen = strlen(namecache_entry->relname);
       dst_entry->relname.data[namelen] = 0;
       LWLockRelease(data->relaccess_ht_lock);
       hash_search(local_access_entries, &src_entry->key, HASH_REMOVE, &found);
@@ -441,7 +441,7 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
   while ((entry = hash_seq_search(&hash_seq)) != NULL) {
     bool found;
     fileDumpEntry *dumpfile =
-        hash_search(files, &entry->key.dbid, HASH_ENTER_NULL, &found);
+        hash_search(files, &entry->key.dbid, HASH_FIND, &found);
     if (!found) {
       // ignore this dbid
       continue;
@@ -464,7 +464,7 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     resetStringInfo(&entry_csv_line);
     // TODO: figure out a safer way to remove entries from HT.
     // If for some reason we fail upserting dumped data somewhere later
-    // those stats are forever lost for us
+    // those stats are forever lost to us
     hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
     Assert(found);
   }
