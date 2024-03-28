@@ -90,7 +90,7 @@ typedef struct localAccessKey {
 
 typedef struct localAccessEntry {
   localAccessKey key;
-  Timestamp when;
+  Timestamp last_read, last_write;
   AclMode perms;
 } localAccessEntry;
 
@@ -120,6 +120,10 @@ static bool had_ht_overflow = false;
 
 #define IS_POSTGRES_DB                                                         \
   (strcmp("postgres", get_database_name(MyDatabaseId)) == 0)
+
+#define is_read(perms) (((perms)&ACL_SELECT) != 0)
+#define is_write(perms)                                                        \
+  (((perms) & (ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) != 0)
 
 static void relaccess_shmem_startup() {
   bool found;
@@ -274,8 +278,7 @@ static bool collect_relaccess_hook(List *rangeTable,
       }
       Oid relid = rte->relid;
       AclMode requiredPerms = rte->requiredPerms;
-      if (requiredPerms &
-          (ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) {
+      if (is_read(requiredPerms) || is_write(requiredPerms)) {
         memorize_local_access_entry(relid, requiredPerms);
         update_relname_cache(relid, NULL);
       }
@@ -383,15 +386,9 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
         UPDATE_STAT(update, UPDATE);
         UPDATE_STAT(delete, DELETE);
         UPDATE_STAT(truncate, TRUNCATE);
-        if (src_entry->perms & (ACL_SELECT)) {
-          dst_entry->last_read =
-              Max(GetCurrentTimestamp(), dst_entry->last_read);
-        }
-        if (src_entry->perms &
-            (ACL_INSERT | ACL_DELETE | ACL_UPDATE | ACL_TRUNCATE)) {
-          dst_entry->last_write =
-              Max(GetCurrentTimestamp(), dst_entry->last_write);
-        }
+        dst_entry->last_read = Max(src_entry->last_read, dst_entry->last_read);
+        dst_entry->last_write =
+            Max(src_entry->last_write, dst_entry->last_write);
         relnameCacheEntry *namecache_entry = (relnameCacheEntry *)hash_search(
             relname_cache, &key.relid, HASH_ENTER, &found);
         Assert(namecache_entry);
@@ -578,10 +575,16 @@ static void memorize_local_access_entry(Oid relid, AclMode perms) {
   localAccessEntry *entry = (localAccessEntry *)hash_search(
       local_access_entries, &key, HASH_ENTER, &found);
   if (!found) {
-    entry->when = GetCurrentTimestamp();
     entry->perms = perms;
   } else {
     entry->perms |= perms;
+  }
+  TimestampTz curts = GetCurrentTimestamp();
+  if (is_read(perms)) {
+    entry->last_read = curts;
+  }
+  if (is_write(perms)) {
+    entry->last_write = curts;
   }
 }
 
