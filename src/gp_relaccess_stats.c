@@ -28,6 +28,7 @@ PG_MODULE_MAGIC;
 void _PG_init(void);
 void _PG_fini(void);
 PG_FUNCTION_INFO_V1(relaccess_stats_update);
+PG_FUNCTION_INFO_V1(relaccess_stats_dump);
 
 static void relaccess_stats_update_internal(void);
 static void relaccess_dump_to_files(bool only_this_db);
@@ -66,7 +67,7 @@ typedef struct relaccessHashKey {
 
 typedef struct relaccessEntry {
   relaccessHashKey key;
-  NameData relname;
+  char relname[NAMEDATALEN];
   Oid userid;
   TimestampTz last_read;
   TimestampTz last_write;
@@ -95,7 +96,7 @@ typedef struct localAccessEntry {
 
 typedef struct relnameCacheEntry {
   Oid relid;
-  char *relname;
+  char relname[NAMEDATALEN];
 } relnameCacheEntry;
 
 typedef struct fileDumpEntry {
@@ -141,9 +142,9 @@ static void relaccess_shmem_startup() {
   info.entrysize = sizeof(relaccessEntry);
   info.hash = relaccess_hash_fn;
   info.match = relaccess_match_fn;
-  relaccesses =
-      ShmemInitHash("relaccess_stats hash", relaccess_size, relaccess_size,
-                    &info, HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+  relaccesses = ShmemInitHash(
+      "relaccess_stats hash", relaccess_size, relaccess_size, &info,
+      (HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_FIXED_SIZE));
 
   LWLockRelease(AddinShmemInitLock);
 
@@ -172,7 +173,7 @@ static int relaccess_match_fn(const void *key1, const void *key2,
                               Size keysize) {
   const relaccessHashKey *k1 = (const relaccessHashKey *)key1;
   const relaccessHashKey *k2 = (const relaccessHashKey *)key2;
-  return (k1->dbid == k2->dbid && k1->relid == k2->relid ? 0 : 1);
+  return (k1->dbid == k2->dbid && k1->relid == k2->relid) ? 0 : 1;
 }
 
 static uint32 local_relaccess_hash_fn(const void *key, Size keysize) {
@@ -184,7 +185,7 @@ static int local_relaccess_match_fn(const void *key1, const void *key2,
                                     Size keysize) {
   const localAccessKey *k1 = (const localAccessKey *)key1;
   const localAccessKey *k2 = (const localAccessKey *)key2;
-  return (k1->stmt_cnt == k2->stmt_cnt && k1->relid == k2->relid ? 0 : 1);
+  return (k1->stmt_cnt == k2->stmt_cnt && k1->relid == k2->relid) ? 0 : 1;
 }
 
 void _PG_init(void) {
@@ -289,8 +290,6 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
                                   char *completionTag) {
   if (nodeTag(parsetree) == T_TruncateStmt && is_enabled &&
       Gp_role == GP_ROLE_DISPATCH) {
-    MemoryContext oldcontext;
-    oldcontext = MemoryContextSwitchTo(TopTransactionContext);
     TruncateStmt *stmt = (TruncateStmt *)parsetree;
     ListCell *cell;
     /**
@@ -304,10 +303,9 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
       Relation rel;
       rel = heap_openrv(rv, AccessExclusiveLock);
       memorize_local_access_entry(rel->rd_id, ACL_TRUNCATE);
-      update_relname_cache(rel->rd_id, pstrdup(rv->relname));
+      update_relname_cache(rel->rd_id, rv->relname);
       heap_close(rel, NoLock);
     }
-    MemoryContextSwitchTo(oldcontext);
   }
   if (next_ProcessUtility_hook) {
     next_ProcessUtility_hook(parsetree, queryString, context, params, dest,
@@ -344,8 +342,8 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
     HASH_SEQ_STATUS hash_seq;
     localAccessEntry *src_entry;
     hash_seq_init(&hash_seq, local_access_entries);
+    LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
     while ((src_entry = hash_seq_search(&hash_seq)) != NULL) {
-      LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
       bool found;
       relaccessHashKey key;
       key.dbid = MyDatabaseId;
@@ -367,11 +365,10 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
           LWLockRelease(data->relaccess_file_lock);
           // we MUST have enough space now
           dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
-                                                    HASH_ENTER_NULL, &found);
+                                                    HASH_ENTER, &found);
           Assert(dst_entry != NULL);
         }
         if (!found) {
-          dst_entry->key = key;
           dst_entry->userid = GetUserId();
           dst_entry->last_read = 0;
           dst_entry->last_write = 0;
@@ -398,9 +395,8 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
         relnameCacheEntry *namecache_entry = (relnameCacheEntry *)hash_search(
             relname_cache, &key.relid, HASH_ENTER, &found);
         Assert(namecache_entry);
-        strcpy(dst_entry->relname.data, namecache_entry->relname);
-        int namelen = strlen(namecache_entry->relname);
-        dst_entry->relname.data[namelen] = 0;
+        strlcpy(dst_entry->relname, namecache_entry->relname,
+                sizeof(dst_entry->relname));
       } else {
         if (!had_ht_overflow) {
           elog(WARNING, "gp_relaccess_stats.max_tables is exceeded! New table "
@@ -410,18 +406,28 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
         }
         had_ht_overflow = true;
       }
-      LWLockRelease(data->relaccess_ht_lock);
-      hash_search(local_access_entries, &src_entry->key, HASH_REMOVE, &found);
       Assert(found);
     }
+    LWLockRelease(data->relaccess_ht_lock);
+    CLEAR_HTAB(localAccessEntry, local_access_entries, key);
+    CLEAR_HTAB(relnameCacheEntry, relname_cache, relid);
   } else if (event == XACT_EVENT_ABORT) {
     CLEAR_HTAB(localAccessEntry, local_access_entries, key);
+    CLEAR_HTAB(relnameCacheEntry, relname_cache, relid);
   }
-  CLEAR_HTAB(relnameCacheEntry, relname_cache, relid);
 }
 
 Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
   relaccess_stats_update_internal();
+  PG_RETURN_VOID();
+}
+
+Datum relaccess_stats_dump(PG_FUNCTION_ARGS) {
+  LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
+  relaccess_dump_to_files(true);
+  LWLockRelease(data->relaccess_file_lock);
+  LWLockRelease(data->relaccess_ht_lock);
   PG_RETURN_VOID();
 }
 
@@ -504,7 +510,7 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     write_time_buf[MAXDATELEN] = 0;
     appendStringInfo(
         &entry_csv_line, "%d,\"%s\",%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
-        entry->key.relid, entry->relname.data, entry->userid, read_time_buf,
+        entry->key.relid, entry->relname, entry->userid, read_time_buf,
         write_time_buf, entry->n_select, entry->n_insert, entry->n_update,
         entry->n_delete, entry->n_truncate);
     if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, dumpfile->file) !=
@@ -513,13 +519,12 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
       // TODO: handle
       break;
     }
-    resetStringInfo(&entry_csv_line);
     // TODO: figure out a safer way to remove entries from HT.
     // If for some reason we fail upserting dumped data somewhere later
     // those stats are forever lost to us
     hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
     had_ht_overflow = false;
-    Assert(found);
+    resetStringInfo(&entry_csv_line);
   }
 }
 
@@ -543,12 +548,10 @@ static void update_relname_cache(Oid relid, char *relname) {
   if (!found) {
     relname_entry->relid = relid;
     if (!relname) {
-      MemoryContext oldcontext;
-      oldcontext = MemoryContextSwitchTo(TopTransactionContext);
-      relname_entry->relname = get_rel_name(relid);
-      MemoryContextSwitchTo(oldcontext);
+      strlcpy(relname_entry->relname, get_rel_name(relid),
+              sizeof(relname_entry->relname));
     } else {
-      relname_entry->relname = relname;
+      strlcpy(relname_entry->relname, relname, sizeof(relname_entry->relname));
     }
   } else {
     /**
@@ -575,7 +578,6 @@ static void memorize_local_access_entry(Oid relid, AclMode perms) {
   localAccessEntry *entry = (localAccessEntry *)hash_search(
       local_access_entries, &key, HASH_ENTER, &found);
   if (!found) {
-    entry->key = key;
     entry->when = GetCurrentTimestamp();
     entry->perms = perms;
   } else {

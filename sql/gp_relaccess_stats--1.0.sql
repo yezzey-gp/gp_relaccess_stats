@@ -16,6 +16,11 @@ CREATE TABLE relaccess_stats (
     n_truncate_queries int
 ) DISTRIBUTED BY (relid);
 
+CREATE FUNCTION relaccess_stats_dump()
+RETURNS void
+AS 'MODULE_PATHNAME', 'relaccess_stats_dump'
+LANGUAGE C EXECUTE ON MASTER;
+
 CREATE FUNCTION relaccess_stats_update()
 RETURNS void
 AS 'MODULE_PATHNAME', 'relaccess_stats_update'
