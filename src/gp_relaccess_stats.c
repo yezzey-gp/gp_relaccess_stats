@@ -162,9 +162,7 @@ static void relaccess_shmem_shutdown(int code, Datum arg) {
     return;
   }
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
-  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(false);
-  LWLockRelease(data->relaccess_file_lock);
   LWLockRelease(data->relaccess_ht_lock);
 }
 
@@ -299,15 +297,16 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
      *  TODO: TRUNCATE may be called with ONLY option which limits it only to
      *the root partition. Otherwise it will truncate all child partitions. We
      *might wish to track the difference by explicitly adding records for each
-     *truncated partition in the future
+     *truncated partition in the future if it proves useful
      **/
     foreach (cell, stmt->relations) {
       RangeVar *rv = lfirst(cell);
       Relation rel;
       rel = heap_openrv(rv, AccessExclusiveLock);
-      memorize_local_access_entry(rel->rd_id, ACL_TRUNCATE);
-      update_relname_cache(rel->rd_id, rv->relname);
+      Oid relid = rel->rd_id;
       heap_close(rel, NoLock);
+      memorize_local_access_entry(relid, ACL_TRUNCATE);
+      update_relname_cache(relid, rv->relname);
     }
   }
   if (next_ProcessUtility_hook) {
@@ -340,6 +339,7 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
   if (Gp_role != GP_ROLE_DISPATCH || !is_enabled) {
     return;
   }
+  // TODO: add support for savepoint rollbacks
   Assert(GetCurrentTransactionNestLevel == 1);
   if (event == XACT_EVENT_COMMIT) {
     HASH_SEQ_STATUS hash_seq;
@@ -363,13 +363,22 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
       }
       if (dst_entry || dump_on_overflow) {
         if (!dst_entry) {
-          LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
           relaccess_dump_to_files(false);
-          LWLockRelease(data->relaccess_file_lock);
-          // we MUST have enough space now
+          // we MUST have enough space now, unless we were unable to dump
           dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
-                                                    HASH_ENTER, &found);
-          Assert(dst_entry != NULL);
+                                                    HASH_ENTER_NULL, &found);
+          if (!dst_entry) {
+            // still no memory left
+            if (!had_ht_overflow) {
+              elog(WARNING, ("gp_relaccess_stats.max_tables is exceeded and we "
+                             "are unable to dump hashtables to disk. "
+                             "Will start loosing some relaccess stats"));
+              had_ht_overflow = true;
+            }
+            continue;
+          } else {
+            had_ht_overflow = false;
+          }
         }
         if (!found) {
           dst_entry->userid = GetUserId();
@@ -403,7 +412,6 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
         }
         had_ht_overflow = true;
       }
-      Assert(found);
     }
     LWLockRelease(data->relaccess_ht_lock);
     CLEAR_HTAB(localAccessEntry, local_access_entries, key);
@@ -421,25 +429,16 @@ Datum relaccess_stats_update(PG_FUNCTION_ARGS) {
 
 Datum relaccess_stats_dump(PG_FUNCTION_ARGS) {
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
-  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(true);
-  LWLockRelease(data->relaccess_file_lock);
   LWLockRelease(data->relaccess_ht_lock);
   PG_RETURN_VOID();
 }
 
 static void relaccess_stats_update_internal() {
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
-  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(true);
   LWLockRelease(data->relaccess_ht_lock);
-  LWLockRelease(data->relaccess_file_lock);
-  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   relaccess_upsert_from_file();
-  StringInfoData filename = get_dump_filename(MyDatabaseId);
-  unlink(filename.data);
-  pfree(filename.data);
-  LWLockRelease(data->relaccess_file_lock);
 }
 
 static void add_file_dump_entry(Oid dbid, HTAB *ht) {
@@ -462,6 +461,7 @@ static void relaccess_dump_to_files(bool only_this_db) {
   ctl.hash = oid_hash;
   file_mapping = hash_create("Relaccess dump files", FILE_CACHE_SZ, &ctl,
                              HASH_ELEM | HASH_FUNCTION);
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   if (only_this_db) {
     add_file_dump_entry(MyDatabaseId, file_mapping);
   } else {
@@ -480,6 +480,7 @@ static void relaccess_dump_to_files(bool only_this_db) {
     FreeFile(entry->file);
     pfree(entry->filename);
   }
+  LWLockRelease(data->relaccess_file_lock);
   hash_destroy(file_mapping);
 }
 
@@ -513,12 +514,12 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, dumpfile->file) !=
         entry_csv_line.len) {
       hash_seq_term(&hash_seq);
-      // TODO: handle
+      ereport(WARNING,
+              (errcode_for_file_access(),
+               errmsg("could not write pg_stat_statement file \"%s\": %m",
+                      dumpfile->filename)));
       break;
     }
-    // TODO: figure out a safer way to remove entries from HT.
-    // If for some reason we fail upserting dumped data somewhere later
-    // those stats are forever lost to us
     hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
     had_ht_overflow = false;
     resetStringInfo(&entry_csv_line);
@@ -526,16 +527,26 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
 }
 
 static void relaccess_upsert_from_file() {
-  SPI_connect();
+  int ret;
+  if ((ret = SPI_connect()) < 0) {
+    /* internal error */
+    elog(ERROR, "SPI connect failure - returned %d", ret);
+  }
+  LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
   StringInfoData filename = get_dump_filename(MyDatabaseId);
   StringInfoData query;
   initStringInfo(&query);
   appendStringInfo(&query, "SELECT __relaccess_upsert_from_dump_file('%s')",
                    filename.data);
-  SPI_execute(query.data, false, 1);
+  ret = SPI_execute(query.data, false, 1);
   SPI_finish();
+  unlink(filename.data);
   pfree(filename.data);
   pfree(query.data);
+  LWLockRelease(data->relaccess_file_lock);
+  if (ret < 0) {
+    elog(ERROR, "SPI execute failure - returned %d", ret);
+  }
 }
 
 static void update_relname_cache(Oid relid, char *relname) {
