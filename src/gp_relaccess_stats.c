@@ -23,6 +23,38 @@
 
 #include <stdlib.h>
 
+/**
+ * gp_relaccess_stats collects runtime access stats on db objects: relations and
+ * views. Stats include last read and write timestamps, last user, last known
+ * relname and number of select, insert, update, delete or truncate queries.
+ * Only committed actions are recorded.
+ *
+ * To track those actions we use:
+ * - ExecutorCheckPerms hook for select, insert, update and delete statements
+ * - ProcessUtility hook for truncate statements
+ *
+ * Intermediate data is stored in three hash tables.
+ * One lives in shared memory and is cleaned only when dumped to disc:
+ * - relaccesses - represents all recorded accesses since last dump to disc.
+ * And two live in coordinator`s local memory and are cleaned on every commit
+ * or rollback:
+ * - local_access_entries - represent all record accesses in for this
+ * transaction only
+ * - relname_cache - maps relid to relname for relations used in this
+ * transaction only
+ *
+ * Ultimately all recorded stats should end up in relaccess_stats table when a
+ * user executes relaccess_stats_update(). But any intermediate stats will be
+ * dumped to disc. This might happen for either or those reasons:
+ * - shmem is exceeded
+ * - server is restarted
+ * - manual execution of relaccess_stats_dump()
+ * In this case stats are offloaded to disc into pg_stat directory into separate
+ * file per each tracked database: pg_stat/relaccess_stats_dump_<dbid>.csv Those
+ * files are upserted into relaccess_stats when relaccess_stats_update() is
+ * called
+ */
+
 PG_MODULE_MAGIC;
 
 void _PG_init(void);
@@ -355,6 +387,7 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
       relaccessEntry *dst_entry = NULL;
       Assert(n_access_records <= relaccess_size);
       if (n_access_records == relaccess_size) {
+        // no room for new entries. Perhaps this relid is already being tracked?
         dst_entry =
             (relaccessEntry *)hash_search(relaccesses, &key, HASH_FIND, &found);
       } else {
@@ -363,6 +396,7 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
       }
       if (dst_entry || dump_on_overflow) {
         if (!dst_entry) {
+          // we are out of shared memory and need to dump
           relaccess_dump_to_files(false);
           // we MUST have enough space now, unless we were unable to dump
           dst_entry = (relaccessEntry *)hash_search(relaccesses, &key,
@@ -485,13 +519,13 @@ static void relaccess_dump_to_files(bool only_this_db) {
 }
 
 static void relaccess_dump_to_files_internal(HTAB *files) {
-  // Dump to tmp .csv file and clear the HT
   HASH_SEQ_STATUS hash_seq;
   relaccessEntry *entry;
   StringInfoData entry_csv_line;
   initStringInfo(&entry_csv_line);
   hash_seq_init(&hash_seq, relaccesses);
-  // alas, timestamptz_to_str isn't safe to be called twice in appendStringInfo
+  // alas, timestamptz_to_str isn't safe to be called twice in appendStringInfo,
+  // hence we create temporary buffers here
   char read_time_buf[MAXDATELEN + 1];
   char write_time_buf[MAXDATELEN + 1];
   while ((entry = hash_seq_search(&hash_seq)) != NULL) {
@@ -499,7 +533,7 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     fileDumpEntry *dumpfile =
         hash_search(files, &entry->key.dbid, HASH_FIND, &found);
     if (!found) {
-      // ignore this dbid
+      // we don't want to dump events from this DB
       continue;
     }
     strncpy(read_time_buf, timestamptz_to_str(entry->last_read), MAXDATELEN);
@@ -529,7 +563,6 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
 static void relaccess_upsert_from_file() {
   int ret;
   if ((ret = SPI_connect()) < 0) {
-    /* internal error */
     elog(ERROR, "SPI connect failure - returned %d", ret);
   }
   LWLockAcquire(data->relaccess_file_lock, LW_EXCLUSIVE);
@@ -624,6 +657,9 @@ static void relaccess_drop_hook(ObjectAccessType access, Oid classId,
   if (prev_object_access_hook) {
     prev_object_access_hook(access, classId, objectId, subId, arg);
   }
+  // we don't want shared memory and .csv files hanging around forever
+  // for databases that we've dropped.
+  // This function cleans up both files and shmem
   if (classId == DatabaseRelationId && access == OAT_DROP) {
     LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
     HASH_SEQ_STATUS hash_seq;
