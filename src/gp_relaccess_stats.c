@@ -61,6 +61,7 @@ void _PG_init(void);
 void _PG_fini(void);
 PG_FUNCTION_INFO_V1(relaccess_stats_update);
 PG_FUNCTION_INFO_V1(relaccess_stats_dump);
+PG_FUNCTION_INFO_V1(relaccess_stats_fillfactor);
 
 static void relaccess_stats_update_internal(void);
 static void relaccess_dump_to_files(bool only_this_db);
@@ -372,7 +373,7 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
     return;
   }
   // TODO: add support for savepoint rollbacks
-  Assert(GetCurrentTransactionNestLevel == 1);
+  Assert(GetCurrentTransactionNestLevel() == 1);
   if (event == XACT_EVENT_COMMIT) {
     HASH_SEQ_STATUS hash_seq;
     localAccessEntry *src_entry;
@@ -466,6 +467,13 @@ Datum relaccess_stats_dump(PG_FUNCTION_ARGS) {
   relaccess_dump_to_files(true);
   LWLockRelease(data->relaccess_ht_lock);
   PG_RETURN_VOID();
+}
+
+Datum relaccess_stats_fillfactor(PG_FUNCTION_ARGS) {
+  LWLockAcquire(data->relaccess_ht_lock, LW_SHARED);
+  int16_t fillfactor = hash_get_num_entries(relaccesses) * 100 / relaccess_size;
+  LWLockRelease(data->relaccess_ht_lock);
+  PG_RETURN_INT16(fillfactor);
 }
 
 static void relaccess_stats_update_internal() {
@@ -572,11 +580,9 @@ static void relaccess_upsert_from_file() {
   appendStringInfo(&query, "SELECT __relaccess_upsert_from_dump_file('%s')",
                    filename.data);
   ret = SPI_execute(query.data, false, 1);
-  SPI_finish();
   unlink(filename.data);
-  pfree(filename.data);
-  pfree(query.data);
   LWLockRelease(data->relaccess_file_lock);
+  SPI_finish();
   if (ret < 0) {
     elog(ERROR, "SPI execute failure - returned %d", ret);
   }

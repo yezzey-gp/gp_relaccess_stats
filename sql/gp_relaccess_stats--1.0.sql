@@ -26,6 +26,11 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'relaccess_stats_update'
 LANGUAGE C EXECUTE ON MASTER;
 
+CREATE FUNCTION relaccess_stats_fillfactor()
+RETURNS INT2
+AS 'MODULE_PATHNAME', 'relaccess_stats_fillfactor'
+LANGUAGE C EXECUTE ON MASTER;
+
 CREATE FUNCTION __relaccess_upsert_from_dump_file(path varchar) RETURNS VOID
 LANGUAGE plpgsql VOLATILE EXECUTE ON MASTER AS
 $func$
