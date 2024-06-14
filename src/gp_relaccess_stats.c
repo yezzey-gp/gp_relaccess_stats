@@ -626,6 +626,8 @@ static void memorize_local_access_entry(Oid relid, AclMode perms) {
       local_access_entries, &key, HASH_ENTER, &found);
   if (!found) {
     entry->perms = perms;
+    entry->last_read = 0;
+    entry->last_write = 0;
   } else {
     entry->perms |= perms;
   }
