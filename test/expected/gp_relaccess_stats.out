@@ -2,6 +2,7 @@
 CREATE EXTENSION gp_relaccess_stats;
 -- get rid of NOTICEs
 SET client_min_messages TO WARNING;
+SET search_path TO mdb_toolkit;
 DROP TABLE IF EXISTS tbl1;
 DROP TABLE IF EXISTS tbl2;
 DROP TABLE IF EXISTS tbl3;

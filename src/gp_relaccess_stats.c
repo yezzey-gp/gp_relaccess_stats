@@ -577,7 +577,8 @@ static void relaccess_upsert_from_file() {
   StringInfoData filename = get_dump_filename(MyDatabaseId);
   StringInfoData query;
   initStringInfo(&query);
-  appendStringInfo(&query, "SELECT __relaccess_upsert_from_dump_file('%s')",
+  appendStringInfo(&query,
+                   "SELECT mdb_toolkit.__relaccess_upsert_from_dump_file('%s')",
                    filename.data);
   ret = SPI_execute(query.data, false, 1);
   unlink(filename.data);

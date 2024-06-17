@@ -3,7 +3,9 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION gp_relaccess_stats" to load this file. \quit
 
-CREATE TABLE relaccess_stats (
+CREATE SCHEMA IF NOT EXISTS mdb_toolkit;
+
+CREATE TABLE mdb_toolkit.relaccess_stats (
     relid Oid,
     relname Name,
     last_user_id Oid,
@@ -16,29 +18,29 @@ CREATE TABLE relaccess_stats (
     n_truncate_queries int
 ) DISTRIBUTED BY (relid);
 
-CREATE FUNCTION relaccess_stats_dump()
+CREATE FUNCTION mdb_toolkit.relaccess_stats_dump()
 RETURNS void
 AS 'MODULE_PATHNAME', 'relaccess_stats_dump'
-LANGUAGE C EXECUTE ON MASTER;
+LANGUAGE C VOLATILE EXECUTE ON MASTER;
 
-CREATE FUNCTION relaccess_stats_update()
+CREATE FUNCTION mdb_toolkit.relaccess_stats_update()
 RETURNS void
 AS 'MODULE_PATHNAME', 'relaccess_stats_update'
-LANGUAGE C EXECUTE ON MASTER;
+LANGUAGE C VOLATILE EXECUTE ON MASTER;
 
-CREATE FUNCTION relaccess_stats_fillfactor()
+CREATE FUNCTION mdb_toolkit.relaccess_stats_fillfactor()
 RETURNS INT2
 AS 'MODULE_PATHNAME', 'relaccess_stats_fillfactor'
-LANGUAGE C EXECUTE ON MASTER;
+LANGUAGE C VOLATILE EXECUTE ON MASTER;
 
-CREATE FUNCTION __relaccess_upsert_from_dump_file(path varchar) RETURNS VOID
-LANGUAGE plpgsql VOLATILE EXECUTE ON MASTER AS
+CREATE FUNCTION mdb_toolkit.__relaccess_upsert_from_dump_file(path varchar) RETURNS VOID
+LANGUAGE plpgsql VOLATILE AS
 $func$
 BEGIN
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp';
-    EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp (LIKE relaccess_stats) distributed by (relid)';
+    EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp (LIKE mdb_toolkit.relaccess_stats) distributed by (relid)';
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp_aggregated';
-    EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp_aggregated (LIKE relaccess_stats) distributed by (relid)';
+    EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp_aggregated (LIKE mdb_toolkit.relaccess_stats) distributed by (relid)';
     EXECUTE format('COPY relaccess_stats_tmp FROM ''%s'' WITH (FORMAT ''csv'', DELIMITER '','')', $1);
     EXECUTE 'WITH aggregated_wo_relname_and_user AS (
         SELECT relid, max(last_read) AS last_read, max(last_write) AS last_write, sum(n_select_queries) AS n_select_queries,
@@ -57,12 +59,12 @@ BEGIN
         n_delete_queries,
         n_truncate_queries FROM aggregated_wo_relname_and_user AS wo';
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp';
-    EXECUTE 'INSERT INTO relaccess_stats
+    EXECUTE 'INSERT INTO mdb_toolkit.relaccess_stats
         SELECT relid, relname, last_user_id, last_read, last_write, 0, 0, 0, 0, 0
         FROM relaccess_stats_tmp_aggregated stage
         WHERE NOT EXISTS (
-            SELECT 1 FROM relaccess_stats orig WHERE orig.relid = stage.relid)';
-    EXECUTE 'UPDATE relaccess_stats orig SET
+            SELECT 1 FROM mdb_toolkit.relaccess_stats orig WHERE orig.relid = stage.relid)';
+    EXECUTE 'UPDATE mdb_toolkit.relaccess_stats orig SET
         relname = stage.relname,
         last_user_id = stage.last_user_id,
         last_read = stage.last_read,
@@ -78,18 +80,18 @@ BEGIN
 END
 $func$;
 
-CREATE FUNCTION relaccess_stats_init() RETURNS VOID AS
+CREATE FUNCTION mdb_toolkit.relaccess_stats_init() RETURNS VOID AS
 $$
     WITH relations AS (
         SELECT oid as relid, relname, relowner FROM pg_catalog.pg_class WHERE relkind in ('r', 'v', 'm', 'f', 'p')
     )
-    INSERT INTO relaccess_stats
+    INSERT INTO mdb_toolkit.relaccess_stats
         SELECT relid, relname, relowner, '2000-01-01 03:00:00', '2000-01-01 03:00:00', 0, 0, 0, 0, 0
-        FROM relations AS all_rels WHERE NOT EXISTS(SELECT 1 FROM relaccess_stats orig WHERE orig.relid = all_rels.relid);
-$$ LANGUAGE SQL VOLATILE EXECUTE ON MASTER;
+        FROM relations AS all_rels WHERE NOT EXISTS(SELECT 1 FROM mdb_toolkit.relaccess_stats orig WHERE orig.relid = all_rels.relid);
+$$ LANGUAGE SQL VOLATILE;
 
 -- This utility view shows **ONLY** stats on **EXISTING** partitioned tables in aggregated form
-CREATE VIEW relaccess_stats_root_tables_aggregated AS (
+CREATE VIEW mdb_toolkit.relaccess_stats_root_tables_aggregated AS (
     WITH RECURSIVE parents AS (
         SELECT inhrelid AS child, inhparent AS parent FROM pg_inherits
         UNION ALL
@@ -101,7 +103,7 @@ CREATE VIEW relaccess_stats_root_tables_aggregated AS (
         UNION
         SELECT * FROM part_to_root_mapping
     ), with_root_id AS (
-        SELECT part_tbl.rootid, stats.* FROM relaccess_stats stats JOIN parts_including_roots part_tbl ON (stats.relid = part_tbl.partid)
+        SELECT part_tbl.rootid, stats.* FROM mdb_toolkit.relaccess_stats stats JOIN parts_including_roots part_tbl ON (stats.relid = part_tbl.partid)
     ), without_last_user AS (
         SELECT rootid AS relid,
             rootid::regclass::text AS relname,
