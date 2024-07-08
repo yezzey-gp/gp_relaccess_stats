@@ -549,10 +549,10 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     read_time_buf[MAXDATELEN] = 0;
     write_time_buf[MAXDATELEN] = 0;
     appendStringInfo(
-        &entry_csv_line, "%d,\"%s\",%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
-        entry->key.relid, entry->relname, entry->userid, read_time_buf,
-        write_time_buf, entry->n_select, entry->n_insert, entry->n_update,
-        entry->n_delete, entry->n_truncate);
+        &entry_csv_line, "%d,\"%s\",%d,%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
+        entry->key.relid, entry->relname, entry->userid, entry->userid,
+        read_time_buf, write_time_buf, entry->n_select, entry->n_insert,
+        entry->n_update, entry->n_delete, entry->n_truncate);
     if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, dumpfile->file) !=
         entry_csv_line.len) {
       hash_seq_term(&hash_seq);

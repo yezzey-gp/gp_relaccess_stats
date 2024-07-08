@@ -8,7 +8,8 @@ CREATE SCHEMA IF NOT EXISTS mdb_toolkit;
 CREATE TABLE mdb_toolkit.relaccess_stats (
     relid Oid,
     relname Name,
-    last_user_id Oid,
+    last_reader_id Oid,
+    last_writer_id Oid,
     last_read timestamp,
     last_write timestamp,
     n_select_queries int,
@@ -50,7 +51,8 @@ BEGIN
     INSERT INTO relaccess_stats_tmp_aggregated
     SELECT relid,
         (SELECT relname FROM relaccess_stats_tmp w WHERE w.relid = wo.relid AND greatest(wo.last_read, wo.last_write) IN (w.last_read, w.last_write) LIMIT 1) AS relname,
-        (SELECT last_user_id FROM relaccess_stats_tmp w WHERE w.relid = wo.relid AND greatest(wo.last_read, wo.last_write) IN (w.last_read, w.last_write) LIMIT 1) AS last_user_id,
+        (SELECT last_reader_id FROM relaccess_stats_tmp w WHERE w.relid = wo.relid AND wo.last_read = w.last_read LIMIT 1) AS last_reader_id,
+        (SELECT last_writer_id FROM relaccess_stats_tmp w WHERE w.relid = wo.relid AND wo.last_write = w.last_write LIMIT 1) AS last_writer_id,
         last_read,
         last_write,
         n_select_queries,
@@ -60,13 +62,14 @@ BEGIN
         n_truncate_queries FROM aggregated_wo_relname_and_user AS wo';
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp';
     EXECUTE 'INSERT INTO mdb_toolkit.relaccess_stats
-        SELECT relid, relname, last_user_id, last_read, last_write, 0, 0, 0, 0, 0
+        SELECT relid, relname, last_reader_id, last_writer_id, last_read, last_write, 0, 0, 0, 0, 0
         FROM relaccess_stats_tmp_aggregated stage
         WHERE NOT EXISTS (
             SELECT 1 FROM mdb_toolkit.relaccess_stats orig WHERE orig.relid = stage.relid)';
     EXECUTE 'UPDATE mdb_toolkit.relaccess_stats orig SET
         relname = stage.relname,
-        last_user_id = stage.last_user_id,
+        last_reader_id = stage.last_reader_id,
+        last_writer_id = stage.last_writer_id,
         last_read = stage.last_read,
         last_write = stage.last_write,
         n_select_queries = orig.n_select_queries + stage.n_select_queries,
@@ -86,7 +89,7 @@ $$
         SELECT oid as relid, relname, relowner FROM pg_catalog.pg_class WHERE relkind in ('r', 'v', 'm', 'f', 'p')
     )
     INSERT INTO mdb_toolkit.relaccess_stats
-        SELECT relid, relname, relowner, '2000-01-01 03:00:00', '2000-01-01 03:00:00', 0, 0, 0, 0, 0
+        SELECT relid, relname, relowner, relowner, '2000-01-01 03:00:00', '2000-01-01 03:00:00', 0, 0, 0, 0, 0
         FROM relations AS all_rels WHERE NOT EXISTS(SELECT 1 FROM mdb_toolkit.relaccess_stats orig WHERE orig.relid = all_rels.relid);
 $$ LANGUAGE SQL VOLATILE;
 
@@ -118,7 +121,8 @@ CREATE VIEW mdb_toolkit.relaccess_stats_root_tables_aggregated AS (
     )
     SELECT relid,
         relname,
-        (SELECT last_user_id FROM with_root_id w WHERE w.rootid = wo.relid AND greatest(wo.last_read, wo.last_write) IN (w.last_read, w.last_write) LIMIT 1) AS last_user_id,
+        (SELECT last_reader_id FROM with_root_id w WHERE w.rootid = wo.relid AND wo.last_read = w.last_read LIMIT 1) AS last_reader_id,
+        (SELECT last_writer_id FROM with_root_id w WHERE w.rootid = wo.relid AND wo.last_write = w.last_write LIMIT 1) AS last_writer_id,
         last_read,
         last_write,
         n_select_queries,
