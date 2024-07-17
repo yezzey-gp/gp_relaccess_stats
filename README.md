@@ -64,6 +64,8 @@ For example, if we have 1 insert into `tbl1_prt_1` and 3 inserts into `tbl1_prt_
 
 Another useful function is `relaccess_stats_dump()`, which simply moves cached stats from shared memory to temporary files in pg_stat directory. This function is cheaper than `relaccess_stats_update` but will evict stats cache if needed. Though, stats in temporary files can also get lost. Hence, it is recommended to stick with frequent `select relaccess_stats_update()` calls.
 
+To better understand when it's time to dump or update the stats one might check `select mdb_toolkit.relaccess_stats_fillfactor();`. It will show current usage of stats hash table in percents. For example if shared memory for our relaccess hash table is 70% full we will get relaccess_stats_fillfactor=70. It would be a good idea to dump or update when fillfactor is around 70%.
+
 ### Limitations and gotchas
 There is a number of interesting edge-cases in this simple extension:
 * `relaccess_stats_root_tables_aggregated` shows info only about tables that exist **now**. We simply can`t get information about inheritance relationship for deleted tables.
@@ -79,6 +81,6 @@ COMMIT;
 There is no technical reason for this limitation. It cat be fixed when there will be need for that.
 * Update stats often! Otherwise, data can be lost if any of it happens: 1) there was a crash, 2) `max_tables` exceeded w/o `dump_on_overflow`, 3) temporary pg_stat dir got cleaned.
 * no `truncate only` support. There is a TODO in code in case it is ever needed.
-* Updates and Deletes also increment n_select_queries. Every update and delete also read the table. That is, n_select_queries get incremented as well. If you need **only** selects, query like this `SELECT n_select_queries - (n_update_queries + n_delete_queries) ... FROM relaccess_stats ...;`
+* Updates and Deletes also increment n_select_queries. Every update and delete also read the table. That is, n_select_queries get incremented as well. If you need **only** selects, query like this `SELECT n_select_queries - (n_update_queries + n_delete_queries) ... FROM relaccess_stats ...;`. For this same reason last_read and last_reader_id change on update and delete queries.
 * view = view + tables. It looks like whenever you select from view, n_select_queries get incremented for both the view and tables it references.
 * obviously, we don't know any timestamps before we started tracking. So, the first timestamps are initialized with 0 (something around year 2000), which means those tables haven't been accessed since gp_relaccess_stats was enabled.
