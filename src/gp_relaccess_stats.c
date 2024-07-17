@@ -101,7 +101,8 @@ typedef struct relaccessHashKey {
 typedef struct relaccessEntry {
   relaccessHashKey key;
   char relname[NAMEDATALEN];
-  Oid userid;
+  Oid last_reader_id;
+  Oid last_writer_id;
   TimestampTz last_read;
   TimestampTz last_write;
   int64 n_select;
@@ -123,6 +124,7 @@ typedef struct localAccessKey {
 
 typedef struct localAccessEntry {
   localAccessKey key;
+  Oid last_reader_id, last_writer_id;
   Timestamp last_read, last_write;
   AclMode perms;
 } localAccessEntry;
@@ -154,9 +156,10 @@ static bool had_ht_overflow = false;
 #define IS_POSTGRES_DB                                                         \
   (strcmp("postgres", get_database_name(MyDatabaseId)) == 0)
 
-#define is_read(perms) (((perms)&ACL_SELECT) != 0)
 #define is_write(perms)                                                        \
   (((perms) & (ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE)) != 0)
+
+#define is_read(perms) (!is_write(perms) && ((perms)&ACL_SELECT) != 0)
 
 static void relaccess_shmem_startup() {
   bool found;
@@ -416,7 +419,8 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
           }
         }
         if (!found) {
-          dst_entry->userid = GetUserId();
+          dst_entry->last_reader_id = InvalidOid;
+          dst_entry->last_writer_id = InvalidOid;
           dst_entry->last_read = 0;
           dst_entry->last_write = 0;
           dst_entry->n_select = 0;
@@ -430,9 +434,14 @@ static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
         UPDATE_STAT(update, UPDATE);
         UPDATE_STAT(delete, DELETE);
         UPDATE_STAT(truncate, TRUNCATE);
-        dst_entry->last_read = Max(src_entry->last_read, dst_entry->last_read);
-        dst_entry->last_write =
-            Max(src_entry->last_write, dst_entry->last_write);
+        if (src_entry->last_read > dst_entry->last_read) {
+          dst_entry->last_read = src_entry->last_read;
+          dst_entry->last_reader_id = src_entry->last_reader_id;
+        }
+        if (src_entry->last_write > dst_entry->last_write) {
+          dst_entry->last_write = src_entry->last_write;
+          dst_entry->last_writer_id = src_entry->last_writer_id;
+        }
         relnameCacheEntry *namecache_entry = (relnameCacheEntry *)hash_search(
             relname_cache, &key.relid, HASH_ENTER, &found);
         Assert(namecache_entry);
@@ -550,9 +559,9 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
     write_time_buf[MAXDATELEN] = 0;
     appendStringInfo(
         &entry_csv_line, "%d,\"%s\",%d,%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
-        entry->key.relid, entry->relname, entry->userid, entry->userid,
-        read_time_buf, write_time_buf, entry->n_select, entry->n_insert,
-        entry->n_update, entry->n_delete, entry->n_truncate);
+        entry->key.relid, entry->relname, entry->last_reader_id,
+        entry->last_writer_id, read_time_buf, write_time_buf, entry->n_select,
+        entry->n_insert, entry->n_update, entry->n_delete, entry->n_truncate);
     if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, dumpfile->file) !=
         entry_csv_line.len) {
       hash_seq_term(&hash_seq);
@@ -626,6 +635,7 @@ static void memorize_local_access_entry(Oid relid, AclMode perms) {
   localAccessEntry *entry = (localAccessEntry *)hash_search(
       local_access_entries, &key, HASH_ENTER, &found);
   if (!found) {
+    entry->last_read = entry->last_write = InvalidOid;
     entry->perms = perms;
     entry->last_read = 0;
     entry->last_write = 0;
@@ -634,9 +644,11 @@ static void memorize_local_access_entry(Oid relid, AclMode perms) {
   }
   TimestampTz curts = GetCurrentTimestamp();
   if (is_read(perms)) {
+    entry->last_reader_id = GetUserId();
     entry->last_read = curts;
   }
   if (is_write(perms)) {
+    entry->last_writer_id = GetUserId();
     entry->last_write = curts;
   }
 }

@@ -68,10 +68,6 @@ BEGIN
             SELECT 1 FROM mdb_toolkit.relaccess_stats orig WHERE orig.relid = stage.relid)';
     EXECUTE 'UPDATE mdb_toolkit.relaccess_stats orig SET
         relname = stage.relname,
-        last_reader_id = stage.last_reader_id,
-        last_writer_id = stage.last_writer_id,
-        last_read = stage.last_read,
-        last_write = stage.last_write,
         n_select_queries = orig.n_select_queries + stage.n_select_queries,
         n_insert_queries = orig.n_insert_queries + stage.n_insert_queries,
         n_update_queries = orig.n_update_queries + stage.n_update_queries,
@@ -79,6 +75,14 @@ BEGIN
         n_truncate_queries = orig.n_truncate_queries + stage.n_truncate_queries
     FROM relaccess_stats_tmp_aggregated stage
         WHERE orig.relid = stage.relid';
+    EXECUTE 'UPDATE mdb_toolkit.relaccess_stats orig SET
+        last_reader_id = stage.last_reader_id, last_read = stage.last_read
+    FROM relaccess_stats_tmp_aggregated stage
+        WHERE orig.relid = stage.relid AND orig.last_read < stage.last_read';
+    EXECUTE 'UPDATE mdb_toolkit.relaccess_stats orig SET
+        last_writer_id = stage.last_writer_id, last_write = stage.last_write
+    FROM relaccess_stats_tmp_aggregated stage
+        WHERE orig.relid = stage.relid AND orig.last_write < stage.last_write';
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp_aggregated';
 END
 $func$;

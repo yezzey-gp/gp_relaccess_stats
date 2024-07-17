@@ -3,15 +3,22 @@ CREATE EXTENSION gp_relaccess_stats;
 -- get rid of NOTICEs
 SET client_min_messages TO WARNING;
 SET search_path TO mdb_toolkit;
-DROP TABLE IF EXISTS tbl1;
-DROP TABLE IF EXISTS tbl2;
-DROP TABLE IF EXISTS tbl3;
-DROP TABLE IF EXISTS tbl4;
-DROP TABLE IF EXISTS new_tbl1;
-DROP TABLE IF EXISTS p3_sales;
+DROP TABLE IF EXISTS tbl1 CASCADE;
+DROP TABLE IF EXISTS tbl2 CASCADE;
+DROP TABLE IF EXISTS tbl3 CASCADE;
+DROP TABLE IF EXISTS tbl4 CASCADE;
+DROP TABLE IF EXISTS new_tbl1 CASCADE;
+DROP TABLE IF EXISTS p3_sales CASCADE;
+DROP TABLE IF EXISTS public.last_usr_checks CASCADE;
+DROP USER IF EXISTS select_usr;
+DROP USER IF EXISTS update_usr;
+DROP USER IF EXISTS insert_usr;
+DROP USER IF EXISTS delete_usr;
+DROP USER IF EXISTS truncate_usr;
 
 -- make sure tracking is ON
 SET gp_relaccess_stats.enabled TO 'on';
+SELECT relaccess_stats_init();
 SELECT relaccess_stats_update();
 TRUNCATE relaccess_stats;
 
@@ -120,6 +127,41 @@ FROM relaccess_stats WHERE relname LIKE 'p3_sales%' ORDER BY relname;
 SELECT relname, n_select_queries, n_insert_queries, n_update_queries, n_delete_queries, n_truncate_queries 
 FROM relaccess_stats_root_tables_aggregated WHERE relname LIKE 'p3_sales%' ORDER BY relname;
 
+-- test last_reader and last_writer
+CREATE USER select_usr;
+CREATE USER update_usr;
+CREATE USER insert_usr;
+CREATE USER delete_usr;
+CREATE USER truncate_usr;
+CREATE TABLE public.last_usr_checks(a integer);
+GRANT ALL ON TABLE public.last_usr_checks TO select_usr, update_usr, insert_usr, delete_usr, truncate_usr;
+SET ROLE select_usr;
+SELECT COUNT(*) FROM public.last_usr_checks;
+RESET ROLE;
+SELECT relaccess_stats_update();
+SELECT (SELECT last_reader_id FROM relaccess_stats WHERE RELNAME = 'last_usr_checks') = (SELECT oid FROM pg_roles WHERE rolname = 'select_usr');
+SET ROLE insert_usr;
+INSERT INTO public.last_usr_checks VALUES (-1), (0), (1);
+RESET ROLE;
+SELECT relaccess_stats_update();
+SELECT (SELECT last_writer_id FROM relaccess_stats WHERE RELNAME = 'last_usr_checks') = (SELECT oid FROM pg_roles WHERE rolname = 'insert_usr');
+SET ROLE update_usr;
+UPDATE public.last_usr_checks SET a = a*10 WHERE a < 0;
+RESET ROLE;
+SELECT relaccess_stats_update();
+SELECT (SELECT last_writer_id FROM relaccess_stats WHERE RELNAME = 'last_usr_checks') = (SELECT oid FROM pg_roles WHERE rolname = 'update_usr');
+SET ROLE delete_usr;
+DELETE FROM public.last_usr_checks WHERE a >= 0;
+RESET ROLE;
+SELECT relaccess_stats_update();
+SELECT (SELECT last_writer_id FROM relaccess_stats WHERE RELNAME = 'last_usr_checks') = (SELECT oid FROM pg_roles WHERE rolname = 'delete_usr');
+SET ROLE truncate_usr;
+TRUNCATE public.last_usr_checks;
+RESET ROLE;
+SELECT relaccess_stats_update();
+SELECT (SELECT last_writer_id FROM relaccess_stats WHERE RELNAME = 'last_usr_checks') = (SELECT oid FROM pg_roles WHERE rolname = 'truncate_usr');
+RESET ROLE;
+
 -- make sure we can turn it OFF
 SET gp_relaccess_stats.enabled TO 'off';
 SELECT relaccess_stats_update();
@@ -128,4 +170,17 @@ SELECT * FROM tbl1;
 SELECT relaccess_stats_update();
 SELECT count(*) FROM relaccess_stats;
 RESET gp_relaccess_stats.enabled;
+
+DROP TABLE tbl1 CASCADE;
+DROP TABLE tbl2 CASCADE;
+DROP TABLE tbl3 CASCADE;
+DROP TABLE tbl4 CASCADE;
+DROP TABLE new_tbl1 CASCADE;
+DROP TABLE p3_sales CASCADE;
+DROP TABLE public.last_usr_checks CASCADE;
+DROP USER select_usr;
+DROP USER update_usr;
+DROP USER insert_usr;
+DROP USER delete_usr;
+DROP USER truncate_usr;
 
