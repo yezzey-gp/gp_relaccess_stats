@@ -22,6 +22,7 @@
 #include "tcop/utility.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 
 /**
  * gp_relaccess_stats collects runtime access stats on db objects: relations and
@@ -371,7 +372,7 @@ static void collect_truncate_hook(Node *parsetree, const char *queryString,
     }                                                                          \
   }
 
-static void relaccess_xact_callback(XactEvent event, void * /*arg*/) {
+static void relaccess_xact_callback(XactEvent event, void *arg) {
   if (Gp_role != GP_ROLE_DISPATCH || !is_enabled) {
     return;
   }
