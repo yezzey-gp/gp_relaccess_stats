@@ -2,5 +2,5 @@
 comment = 'gp_relaccess_stats - facility to track how and when tables, partitions or views were accesseds'
 default_version = '1.0'
 module_pathname = '$libdir/gp_relaccess_stats'
-superuser = true
-
+relocatable = true
+trusted = true
