@@ -7,6 +7,7 @@
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_config_ext.h"
 #include "pgstat.h"
@@ -63,6 +64,7 @@ void _PG_fini(void);
 PG_FUNCTION_INFO_V1(relaccess_stats_update);
 PG_FUNCTION_INFO_V1(relaccess_stats_dump);
 PG_FUNCTION_INFO_V1(relaccess_stats_fillfactor);
+PG_FUNCTION_INFO_V1(relaccess_stats_from_dump);
 
 static void relaccess_stats_update_internal(void);
 static void relaccess_dump_to_files(bool only_this_db);
@@ -486,6 +488,91 @@ Datum relaccess_stats_fillfactor(PG_FUNCTION_ARGS) {
   PG_RETURN_INT16(fillfactor);
 }
 
+Datum relaccess_stats_from_dump(PG_FUNCTION_ARGS) {
+  FuncCallContext *funcctx;
+  List *stats_entries = NIL;
+
+  if (SRF_IS_FIRSTCALL()) {
+    funcctx = SRF_FIRSTCALL_INIT();
+    MemoryContext oldcontext =
+        MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+    TupleDesc tupdesc = CreateTemplateTupleDesc(11, false /* hasoid */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)1, "relid", OIDOID, -1 /* typmod */,
+                       0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)2, "relname", NAMEOID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)3, "last_reader_id", OIDOID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)4, "last_writer_id", OIDOID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)5, "last_read", TIMESTAMPTZOID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)6, "last_write", TIMESTAMPTZOID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)7, "n_select_queries", INT4OID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)8, "n_insert_queries", INT4OID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)9, "n_update_queries", INT4OID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)10, "n_delete_queries", INT4OID,
+                       -1 /* typmod */, 0 /* attdim */);
+    TupleDescInitEntry(tupdesc, (AttrNumber)11, "n_truncate_queries", INT4OID,
+                       -1 /* typmod */, 0 /* attdim */);
+    funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+    StringInfoData dump_file = get_dump_filename(MyDatabaseId);
+    FILE *dump = AllocateFile(dump_file.data, "rb");
+    pfree(dump_file.data);
+    if (dump) {
+      while (true) {
+        relaccessEntry *entry = palloc(sizeof(relaccessEntry));
+        if (fread(entry, sizeof(relaccessEntry), 1, dump) != 1) {
+          pfree(entry);
+          break;
+        }
+        stats_entries = lappend(stats_entries, entry);
+      }
+      FreeFile(dump);
+    }
+    funcctx->user_fctx = stats_entries;
+    MemoryContextSwitchTo(oldcontext);
+  }
+
+  funcctx = SRF_PERCALL_SETUP();
+  stats_entries = (List *)funcctx->user_fctx;
+
+  while (true) {
+    if (stats_entries == NIL) {
+      SRF_RETURN_DONE(funcctx);
+    }
+    relaccessEntry *entry = linitial(stats_entries);
+    stats_entries = list_delete_first(stats_entries);
+    Datum values[11];
+    bool nulls[11];
+    MemSet(nulls, 0, sizeof(nulls));
+    values[0] = ObjectIdGetDatum(entry->key.relid);
+    values[1] = CStringGetDatum(entry->relname);
+    values[2] = ObjectIdGetDatum(entry->last_reader_id);
+    values[3] = ObjectIdGetDatum(entry->last_writer_id);
+    values[4] = TimestampTzGetDatum(entry->last_read);
+    values[5] = TimestampTzGetDatum(entry->last_write);
+    values[6] = Int32GetDatum(entry->n_select);
+    values[7] = Int32GetDatum(entry->n_insert);
+    values[8] = Int32GetDatum(entry->n_update);
+    values[9] = Int32GetDatum(entry->n_delete);
+    values[10] = Int32GetDatum(entry->n_truncate);
+    HeapTuple tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+    Datum result = HeapTupleGetDatum(tuple);
+    funcctx->user_fctx = stats_entries;
+    /** NOTE: Cannot delete entry from this iteration right now.
+     * For now let's rely on multi_call_memory_ctx until there is a proven
+     * memory problem with this codepath
+     */
+    // pfree(entry);
+    SRF_RETURN_NEXT(funcctx, result);
+  }
+}
+
 static void relaccess_stats_update_internal() {
   LWLockAcquire(data->relaccess_ht_lock, LW_EXCLUSIVE);
   relaccess_dump_to_files(true);
@@ -500,7 +587,7 @@ static void add_file_dump_entry(Oid dbid, HTAB *ht) {
     file_entry->dbid = dbid;
     StringInfoData filename = get_dump_filename(file_entry->dbid);
     file_entry->filename = filename.data;
-    file_entry->file = AllocateFile(file_entry->filename, "at");
+    file_entry->file = AllocateFile(file_entry->filename, "ab");
   }
 }
 
@@ -539,13 +626,7 @@ static void relaccess_dump_to_files(bool only_this_db) {
 static void relaccess_dump_to_files_internal(HTAB *files) {
   HASH_SEQ_STATUS hash_seq;
   relaccessEntry *entry;
-  StringInfoData entry_csv_line;
-  initStringInfo(&entry_csv_line);
   hash_seq_init(&hash_seq, relaccesses);
-  // alas, timestamptz_to_str isn't safe to be called twice in appendStringInfo,
-  // hence we create temporary buffers here
-  char read_time_buf[MAXDATELEN + 1];
-  char write_time_buf[MAXDATELEN + 1];
   while ((entry = hash_seq_search(&hash_seq)) != NULL) {
     bool found;
     fileDumpEntry *dumpfile =
@@ -554,27 +635,16 @@ static void relaccess_dump_to_files_internal(HTAB *files) {
       // we don't want to dump events from this DB
       continue;
     }
-    strncpy(read_time_buf, timestamptz_to_str(entry->last_read), MAXDATELEN);
-    strncpy(write_time_buf, timestamptz_to_str(entry->last_write), MAXDATELEN);
-    read_time_buf[MAXDATELEN] = 0;
-    write_time_buf[MAXDATELEN] = 0;
-    appendStringInfo(
-        &entry_csv_line, "%d,\"%s\",%d,%d,\"%s\",\"%s\",%ld,%ld,%ld,%ld,%ld\n",
-        entry->key.relid, entry->relname, entry->last_reader_id,
-        entry->last_writer_id, read_time_buf, write_time_buf, entry->n_select,
-        entry->n_insert, entry->n_update, entry->n_delete, entry->n_truncate);
-    if (fwrite(entry_csv_line.data, 1, entry_csv_line.len, dumpfile->file) !=
-        entry_csv_line.len) {
+    if (fwrite(entry, sizeof(relaccessEntry), 1, dumpfile->file) != 1) {
       hash_seq_term(&hash_seq);
       ereport(WARNING,
               (errcode_for_file_access(),
-               errmsg("could not write pg_stat_statement file \"%s\": %m",
+               errmsg("could not write gp_relaccess_stats file \"%s\": %m",
                       dumpfile->filename)));
       break;
     }
     hash_search(relaccesses, &entry->key, HASH_REMOVE, &found);
     had_ht_overflow = false;
-    resetStringInfo(&entry_csv_line);
   }
 }
 
@@ -588,8 +658,7 @@ static void relaccess_upsert_from_file() {
   StringInfoData query;
   initStringInfo(&query);
   appendStringInfo(&query,
-                   "SELECT mdb_toolkit.__relaccess_upsert_from_dump_file('%s')",
-                   filename.data);
+                   "SELECT mdb_toolkit.__relaccess_upsert_from_dump_file()");
   ret = SPI_execute(query.data, false, 1);
   unlink(filename.data);
   LWLockRelease(data->relaccess_file_lock);

@@ -10,8 +10,8 @@ CREATE TABLE mdb_toolkit.relaccess_stats (
     relname Name,
     last_reader_id Oid,
     last_writer_id Oid,
-    last_read timestamp,
-    last_write timestamp,
+    last_read timestamptz,
+    last_write timestamptz,
     n_select_queries int,
     n_insert_queries int,
     n_update_queries int,
@@ -34,7 +34,12 @@ RETURNS INT2
 AS 'MODULE_PATHNAME', 'relaccess_stats_fillfactor'
 LANGUAGE C VOLATILE EXECUTE ON MASTER;
 
-CREATE FUNCTION mdb_toolkit.__relaccess_upsert_from_dump_file(path varchar) RETURNS VOID
+CREATE FUNCTION mdb_toolkit.__get_db_stats_from_dump()
+RETURNS SETOF mdb_toolkit.relaccess_stats
+AS 'MODULE_PATHNAME', 'relaccess_stats_from_dump'
+LANGUAGE C VOLATILE EXECUTE ON MASTER;
+
+CREATE FUNCTION mdb_toolkit.__relaccess_upsert_from_dump_file() RETURNS VOID
 LANGUAGE plpgsql VOLATILE AS
 $func$
 BEGIN
@@ -42,7 +47,7 @@ BEGIN
     EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp (LIKE mdb_toolkit.relaccess_stats) distributed by (relid)';
     EXECUTE 'DROP TABLE IF EXISTS relaccess_stats_tmp_aggregated';
     EXECUTE 'CREATE TEMP TABLE relaccess_stats_tmp_aggregated (LIKE mdb_toolkit.relaccess_stats) distributed by (relid)';
-    EXECUTE format('COPY relaccess_stats_tmp FROM ''%s'' WITH (FORMAT ''csv'', DELIMITER '','')', $1);
+    EXECUTE 'INSERT INTO relaccess_stats_tmp SELECT * FROM mdb_toolkit.__get_db_stats_from_dump()';
     EXECUTE 'WITH aggregated_wo_relname_and_user AS (
         SELECT relid, max(last_read) AS last_read, max(last_write) AS last_write, sum(n_select_queries) AS n_select_queries,
             sum(n_insert_queries) AS n_insert_queries, sum(n_update_queries) AS n_update_queries, sum(n_delete_queries) AS n_delete_queries, sum(n_truncate_queries) AS n_truncate_queries
