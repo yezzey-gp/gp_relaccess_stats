@@ -64,7 +64,7 @@ For example, if we have 1 insert into `tbl1_prt_1` and 3 inserts into `tbl1_prt_
 
 Another useful function is `relaccess_stats_dump()`, which simply moves cached stats from shared memory to temporary files in pg_stat directory. This function is cheaper than `relaccess_stats_update` but will evict stats cache if needed. Though, stats in temporary files can also get lost. Hence, it is recommended to stick with frequent `select relaccess_stats_update()` calls.
 
-To better understand when it's time to dump or update the stats one might check `select mdb_toolkit.relaccess_stats_fillfactor();`. It will show current usage of stats hash table in percents. For example if shared memory for our relaccess hash table is 70% full we will get relaccess_stats_fillfactor=70. It would be a good idea to dump or update when fillfactor is around 70%.
+To better understand when it's time to dump or update the stats one might check `select relaccess.relaccess_stats_fillfactor();`. It will show current usage of stats hash table in percents. For example if shared memory for our relaccess hash table is 70% full we will get relaccess_stats_fillfactor=70. It would be a good idea to dump or update when fillfactor is around 70%.
 
 ### Limitations and gotchas
 There is a number of interesting edge-cases in this simple extension:

@@ -658,7 +658,7 @@ static void relaccess_upsert_from_file() {
   StringInfoData query;
   initStringInfo(&query);
   appendStringInfo(&query,
-                   "SELECT mdb_toolkit.__relaccess_upsert_from_dump_file()");
+                   "SELECT relaccess.__relaccess_upsert_from_dump_file()");
   ret = SPI_execute(query.data, false, 1);
   unlink(filename.data);
   LWLockRelease(data->relaccess_file_lock);
