@@ -52,9 +52,9 @@ The `relaccess_stats` table itself looks like this:
 | last_read | Timestamp of the most recent select |
 | last_write | Timestamp of the most recent insert/delete/update/truncate |
 | n_select_queries |  |
-| n_select_queries |  |
-| n_select_queries |  |
-| n_select_queries |  |
+| n_insert_queries |  |
+| n_update_queries |  |
+| n_delete_queries |  |
 | n_truncate_queries |  |
 
 **NOTE**: n_*_queries columns count the number of queries executed, not the number of rows read, inserted, deleted or updated.
